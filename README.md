@@ -216,14 +216,14 @@ jobs and executing them asynchronously.
 
 Problem is setting a vector on two seperate arrays and making a dot product
 with them and writing to the first array's vector. Every array contains
-storage for 100 million vector and this operation done with all the array.
+storage for 100 million vector and this operation done to all the array.
 
 The tested example code is ```examples/aparalleljob.c```. Code parses array
 to parts and creates a job for each of them. Then marks them ready to make
 them executed by schedi system.
 
-The same problem is solved with single-thread approach on 
-```examples/aparalleljob_mono.c``` also to compare them.
+The same problem is solved also with single-thread approach 
+on ```examples/aparalleljob_mono.c``` to compare them.
 
 ##### 2 threaded schedi with whole job parsed into 2 jobs
 
