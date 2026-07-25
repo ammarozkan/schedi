@@ -1,0 +1,27 @@
+#define VECTOR_COUNT 130000000
+
+
+#define EQUALITY 2
+
+#define PARALLEL_JOB_COUNT EQUALITY
+#define THREAD_COUNT EQUALITY
+
+
+
+#define VECTOR_TYPE struct Vector2
+VECTOR_TYPE {
+	float x,y;
+};
+
+#define RANDOM_FLOAT ((float)(847368538%1000000) / 10000.0f)
+#define RANDOM_VECTOR (VECTOR_TYPE){.x = RANDOM_FLOAT, .y = RANDOM_FLOAT}
+
+
+VECTOR_TYPE vecs[VECTOR_COUNT];
+VECTOR_TYPE params[VECTOR_COUNT];
+
+
+VECTOR_TYPE DotProduct(VECTOR_TYPE v1, VECTOR_TYPE v2)
+{
+	return (VECTOR_TYPE){.x = v1.x * v2.x, .y = v1.y * v2.y};
+}
