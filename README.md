@@ -233,8 +233,8 @@ I did 4 tests with
 time ./bin/aparalleljob ; time ./bin/aparalleljob_mono
 ```
 
-and on avarage of 45% with 0.9 standard deviation gain has been made
-on time with 2 thread 2 jobs.
+and on avarage of 45% decrease on time with 0.9 standard deviation has been 
+made on time with 2 thread 2 jobs.
 
 ##### same with 3 thread, 3 job
 
