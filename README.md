@@ -1,6 +1,6 @@
 ## schedi
 
-schedi is a asynchronous multi-thread job scheduling and executing
+schedi is an asynchronous multi-thread job scheduling and executing
 system/library.
 
 Currently there's flaws but gonna talk about it and publish the current
@@ -23,7 +23,7 @@ To compile it as a static library inside the schedi folder
 make lib
 ```
 
-then a source named ```program.c``` with if schedi is at folder ```schedi```:
+then a source named ```program.c``` if schedi is at folder ```schedi``` with:
 
 ```bash
 gcc -I schedi/include program.c schedi/libschedi.a -pthread
@@ -63,7 +63,7 @@ if(schedi_worker_init(16)) {
 ```
 
 In the end, they should be deinitialized. Worker should be deinitialized
-first because workers could be using a job while we deinitialize the jobs.
+first because a worker could be using a job while we deinitialize the jobs.
 
 ```C
 if(schedi_worker_deinit()) {
@@ -82,7 +82,7 @@ if(schedi_job_deinit()) {
 Define a job context struct. Could be in any name, with any variables.
 When a job gets created, it will get the ```&the_context``` as parameter
 and that will be contained in the job's self. Nothing touches to the 
-context except "the job function" (```example_job_function``` in a bit
+context except "the job function" (```example_job_function``` at a bit
 bottom).
 
 ```C
