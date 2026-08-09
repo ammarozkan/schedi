@@ -1,6 +1,6 @@
 ## schedi
 
-schedi is an asynchronous multi-thread job scheduling and executing
+schedi is a asynchronous multi-thread job scheduling and executing
 system/library.
 
 Currently there's flaws but gonna talk about it and publish the current
@@ -23,7 +23,7 @@ To compile it as a static library inside the schedi folder
 make lib
 ```
 
-then a source named ```program.c``` if schedi is at folder ```schedi``` with:
+then a source named ```program.c``` with if schedi is at folder ```schedi```:
 
 ```bash
 gcc -I schedi/include program.c schedi/libschedi.a -pthread
@@ -63,7 +63,7 @@ if(schedi_worker_init(16)) {
 ```
 
 In the end, they should be deinitialized. Worker should be deinitialized
-first because a worker could be using a job while we deinitialize the jobs.
+first because workers could be using a job while we deinitialize the jobs.
 
 ```C
 if(schedi_worker_deinit()) {
@@ -82,7 +82,7 @@ if(schedi_job_deinit()) {
 Define a job context struct. Could be in any name, with any variables.
 When a job gets created, it will get the ```&the_context``` as parameter
 and that will be contained in the job's self. Nothing touches to the 
-context except "the job function" (```example_job_function``` at a bit
+context except "the job function" (```example_job_function``` in a bit
 bottom).
 
 ```C
@@ -216,14 +216,14 @@ jobs and executing them asynchronously.
 
 Problem is setting a vector on two seperate arrays and making a dot product
 with them and writing to the first array's vector. Every array contains
-storage for 100 million vector and this operation done to all the array.
+storage for 100 million vector and this operation done with all the array.
 
 The tested example code is ```examples/aparalleljob.c```. Code parses array
 to parts and creates a job for each of them. Then marks them ready to make
 them executed by schedi system.
 
-The same problem is solved also with single-thread approach 
-on ```examples/aparalleljob_mono.c``` to compare them.
+The same problem is solved with single-thread approach on 
+```examples/aparalleljob_mono.c``` also to compare them.
 
 ##### 2 threaded schedi with whole job parsed into 2 jobs
 
@@ -233,8 +233,8 @@ I did 4 tests with
 time ./bin/aparalleljob ; time ./bin/aparalleljob_mono
 ```
 
-and on avarage of 45% decrease on time with 0.9 standard deviation has been 
-made on time with 2 thread 2 jobs.
+and on avarage of 45% with 0.9 standard deviation gain has been made
+on time with 2 thread 2 jobs.
 
 ##### same with 3 thread, 3 job
 
@@ -270,10 +270,7 @@ once.
 When dividing the job more than 2 jobs and initializing same amount of threads,
 single-thread calculation is generally faster.
 
-#### epoll tool race with returning 0 on job function
-
-When epoll tool is called, epoll could be triggered in the way of returning 0
-thus the try of making it ready to execute. This is faulty.
+#### epoll tool race with returning 0 on job function (solved)
 
 #### one time epoll
 

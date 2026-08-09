@@ -78,6 +78,7 @@ static int name(struct schedi_job *job) 									\
 																			\
 	dq.buf[_htc.head] = job;												\
 	atomic_store_explicit(&dq.ready[_htc.head], true, memory_order_release);\
+	return 0;																\
 }
 
 
@@ -381,7 +382,6 @@ static void schedi_ready_jobs_cache_sub_job_count()
 		desired, memory_order_release, memory_order_relaxed));
 }
 
-#include <stdio.h>
 struct schedi_job* schedi_cache_job_ready_pop()
 {
 	if((job_array.job_count & 0xFFFFFFFF) == 0) return NULL;
@@ -389,7 +389,6 @@ struct schedi_job* schedi_cache_job_ready_pop()
 		struct schedi_job* checked_cache = atomic_load_explicit(&job_array.ready_jobs_cache[i], memory_order_acquire);
 		do {
 			// overhead here
-			//printf("checked_cache:0x%x\n",checked_cache);
 			if(checked_cache == NULL) break;
 			// trying to put NULL if its not NULL.
 			// on success, I will have a pointer that no one has popped out.
@@ -625,12 +624,27 @@ unsigned int schedi_job_mark_ready(struct schedi_job* job)
 {
 	return schedi_job_mark_or(job, SCHEDI_JOB_METAFLAG_READY, 
 		SCHEDI_JOB_METAFLAG_UNSTABLE | 
-		SCHEDI_JOB_METAFLAG_WLLDESTROY, false);
+		SCHEDI_JOB_METAFLAG_WLLDESTROY |
+		SCHEDI_JOB_METAFLAG_READY, false);
 }
 
 unsigned int schedi_job_unmark_ready(struct schedi_job* job)
 {
 	return schedi_job_unmark_or(job, SCHEDI_JOB_METAFLAG_READY, 
+		SCHEDI_JOB_METAFLAG_UNSTABLE | 
+		SCHEDI_JOB_METAFLAG_WLLDESTROY, false);
+}
+
+unsigned int schedi_job_mark_readybasic(struct schedi_job* job)
+{
+	return schedi_job_mark_or(job, SCHEDI_JOB_METAFLAG_READYBASIC, 
+		SCHEDI_JOB_METAFLAG_UNSTABLE | 
+		SCHEDI_JOB_METAFLAG_WLLDESTROY, false);
+}
+
+unsigned int schedi_job_unmark_readybasic(struct schedi_job* job)
+{
+	return schedi_job_unmark_or(job, SCHEDI_JOB_METAFLAG_READYBASIC, 
 		SCHEDI_JOB_METAFLAG_UNSTABLE | 
 		SCHEDI_JOB_METAFLAG_WLLDESTROY, false);
 }
@@ -703,29 +717,32 @@ int schedi_job_destroy(struct schedi_job *job)
 int schedi_job_epoll_request_return(struct schedi_job_epoll_request *req, int error)
 {
 	struct schedi_job* owner = atomic_load_explicit(&(req->owner), memory_order_consume);
-	if (!owner)
+
+	unsigned int bans;
+	while ((bans = schedi_job_mark_access(owner)) && !(bans & SCHEDI_JOB_METAFLAG_UNSTABLE))
+		;
+
+	if (bans)
 		return -1;
 
-	if (schedi_job_mark_access(owner))
+	uint64_t gen = atomic_load_explicit(&(owner->gen), memory_order_acquire);
+	if (gen != req->job_gen) {
+		schedi_job_unmark_access(owner);
 		return -1;
-
-
-	pthread_mutex_lock(&req->list->lock);
-
-	schedi_list_remove(&req->list->list, &req->node);
-
-	req->list->waiting_count--;
-
-	if (error)
-		req->list->err_count++;
-	else
-		req->list->ret_count++;
-
-	if(req->list->waiting_count == 0) {
-		schedi_job_setready(owner);
 	}
 
-	pthread_mutex_unlock(&req->list->lock);
+	struct schedi_job_epoll_requests_list *list = req->list;
+
+	unsigned int prev_waiting = atomic_fetch_sub_explicit(&list->waiting_count, 1, memory_order_acq_rel);
+
+	if (error)
+		atomic_fetch_add_explicit(&list->err_count, 1, memory_order_relaxed);
+	else
+		atomic_fetch_add_explicit(&list->ret_count, 1, memory_order_relaxed);
+
+	if (prev_waiting == 1) {
+		schedi_job_setready_controlled(owner);
+	}
 
 	schedi_job_unmark_access(owner);
 
@@ -751,66 +768,24 @@ int schedi_job_epoll_socket_condition(struct schedi_job_epoll_socket *sock, int 
 	return 1;
 }
 
-/*
- * schedi_job_epoll_list_add - Push a request onto a job's epoll_list.
- * 
- * Should be called after "accessing" the job.
- *
- * Links @req at the end of @job->epoll_list. Increments total_req
- * and waiting_count.
- */
-
-void schedi_job_epoll_list_add(struct schedi_job *job, struct schedi_job_epoll_request *req)
-{
-	struct schedi_job_epoll_requests_list *list = job->epoll_list;
-
-	pthread_mutex_lock(&list->lock);
-
-	schedi_list_add(&list->list, &req->node);
-	list->total_req++;
-	list->waiting_count++;
-
-	pthread_mutex_unlock(&list->lock);
-}
-
-/*
- * schedi_job_epoll_list_remove - Remove a request from a job's epoll_list.
- *
- * Should be called after "accessing" the job.
- *
- * Unlinks @req from @job->epoll_list. Decrements waiting_count.
- */
-
-void schedi_job_epoll_list_remove(struct schedi_job *job, struct schedi_job_epoll_request *req)
-{
-	struct schedi_job_epoll_requests_list *list = job->epoll_list;
-
-	pthread_mutex_lock(&list->lock);
-
-	schedi_list_remove(&list->list, &req->node);
-
-	list->waiting_count--;
-
-	pthread_mutex_unlock(&list->lock);
-}
-
-
 int schedi_job_tool_epoll(struct schedi_job *job, int socketfd, uint32_t events)
 {
-	schedi_job_unmark_ready(job);
 	struct schedi_job_epoll_request *req = malloc(sizeof(*req));
 	if (!req)
 		return -1;
 
 	req->socketfd = socketfd;
 	req->owner = job;
+	req->job_gen = atomic_load_explicit(&(job->gen), memory_order_acquire);
 	req->list = job->epoll_list;
 
-	schedi_job_epoll_list_add(job, req);
+	struct schedi_job_epoll_requests_list *list = req->list;
+	atomic_fetch_add_explicit(&list->total_req, 1, memory_order_relaxed);
+	atomic_fetch_add_explicit(&list->waiting_count, 1, memory_order_acq_rel);
 
 	struct schedi_epoll_data *data = malloc(sizeof(*data));
 	if (!data) {
-		schedi_job_epoll_list_remove(job, req);
+		atomic_fetch_sub_explicit(&list->waiting_count, 1, memory_order_acq_rel);
 		free(req);
 		return -2;
 	}
@@ -819,8 +794,8 @@ int schedi_job_tool_epoll(struct schedi_job *job, int socketfd, uint32_t events)
 	data->as.ptr = req;
 
 	if (schedi_epoll_add(socketfd, data, events) < 0) {
+		atomic_fetch_sub_explicit(&list->waiting_count, 1, memory_order_acq_rel);
 		free(data);
-		schedi_job_epoll_list_remove(job, req);
 		free(req);
 		return -3;
 	}
@@ -834,8 +809,6 @@ struct schedi_job_epoll_requests_list *schedi_job_epoll_requests_list_new(void)
 	if (!list)
 		return NULL;
 
-	pthread_mutex_init(&list->lock, NULL);
-	schedi_list_init(&list->list);
 	list->total_req = 0;
 	list->waiting_count = 0;
 	list->ret_count = 0;
@@ -845,16 +818,6 @@ struct schedi_job_epoll_requests_list *schedi_job_epoll_requests_list_new(void)
 
 void schedi_job_epoll_requests_list_destroy(struct schedi_job_epoll_requests_list *list)
 {
-	pthread_mutex_lock(&list->lock);
-	struct schedi_list_node *node = list->list.first;
-	while (node) {
-		struct schedi_job_epoll_request *req =
-			(struct schedi_job_epoll_request *)node;
-		atomic_store_explicit(&(req->owner), NULL, memory_order_release);
-		node = node->next;
-	}
-	pthread_mutex_unlock(&list->lock);
-	pthread_mutex_destroy(&list->lock);
 	free(list);
 }
 
@@ -909,8 +872,20 @@ _pop_pick:
 	}
 
 	schedi_job_unmark_ready(job);
+	schedi_job_unmark_readybasic(job);
 
 	return job;
+}
+
+int schedi_job_setready_controlled(struct schedi_job* job)
+{
+	uint32_t meta_flag = atomic_load_explicit(&(job->meta_flag), memory_order_acquire);
+	if(!(meta_flag & SCHEDI_JOB_METAFLAG_READYBASIC))
+		return 1;
+	if(job->epoll_list->waiting_count != 0)
+		return 1;
+
+	return schedi_job_setready(job);
 }
 
 
@@ -923,7 +898,9 @@ int schedi_job_setready(struct schedi_job* job)
 #endif /*LOCKLESS_READYJOB*/
 	ret = schedi_job_mark_ready(job);
 
-	schedi_cache_job_ready(job);
+	if(!ret) schedi_cache_job_ready(job);
+	// if something else already marked it ready first theres no need to
+	// cache it again as that one will be caching it.
 
 #ifndef LOCKLESS_READYJOB
 	if(!ret) pthread_cond_signal(&readyjob_cond);

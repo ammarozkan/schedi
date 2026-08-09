@@ -95,7 +95,7 @@ int job_func(struct schedi_job* job)
 			context->server_created = true;
 		}
 		printf("Epoll Tool:%i\n", schedi_job_tool_epoll(job, context->serverfd, EPOLLIN));
-		return 0;
+		return 1;
 	}
 
 	if(!context->client_accepted) {
@@ -104,12 +104,12 @@ int job_func(struct schedi_job* job)
 		if(context->clientfd == -1) {
 			printf("Unsuccesfull client.\n"); 
 			printf("Epoll Tool:%i\n", schedi_job_tool_epoll(job, context->serverfd, EPOLLIN));
-			return 0;
+			return 1;
 		} else {
 			context->client_accepted = true;
 		}
 		printf("Epoll Tool:%i\n", schedi_job_tool_epoll(job, context->clientfd, EPOLLIN));
-		return 0;
+		return 1;
 	}
 
 	char buf[16];

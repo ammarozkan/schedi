@@ -90,7 +90,8 @@ _got_a_job:
 			ret = schedi_job_destroy(job);
 			schedi_flog("schedi_job_destroy called. (code:schedi_job_destroy(job))",ret);
 		} else if(ret == 1) { 
-			schedi_job_setready(job);
+			schedi_job_mark_readybasic(job);
+			schedi_job_setready_controlled(job);
 		} else {
 			job->state = schedi_job_state_suspended;
 		}

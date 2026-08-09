@@ -31,17 +31,24 @@ enum schedi_job_state {
 
 
 #define SCHEDI_JOB_METAFLAG_ALIVE		(1<<0)
+// set when the slot is being set up (right after section_claim()) and when
+// it is being torn down (first call in schedi_job_destroy_now()).
 #define SCHEDI_JOB_METAFLAG_UNSTABLE		(1<<1)
 #define SCHEDI_JOB_METAFLAG_EXECUTING		(1<<2)
 #define SCHEDI_JOB_METAFLAG_WLLDESTROY		(1<<3)
 #define SCHEDI_JOB_METAFLAG_DESTROYNOTENT	(1<<4) // job couldnt pushed to the destroy queue. its full.
 #define SCHEDI_JOB_METAFLAG_READY			(1<<5) // ready to execute
+#define SCHEDI_JOB_METAFLAG_READYBASIC		(1<<6) // job function returned, wants to be run again
 
-// in later writings, READY should be the last thing while EPOLLREQ_READY 
-// and EPOLLSOCK_READY are at full control of their own. After they both
-// are flagged, READY will be flagged with readyjob_mutex. Then readyjob_cond
-// will be signaled. Currently it should be done just by EPOLLREQ_READY
-// and wakey wakey should also invoked by it.
+// READY is the "last thing" and should be the only flag the readyjob_mutex
+// + readyjob_cond machinery watches. READYBASIC means the job is at rest
+// and wanted to be run again. It is set by the worker automatically when
+// the job function returns 1, or "outside of the system" by the job's
+// owner after a return 0 — giving the user control over when a suspended
+// job is allowed to resume. The "epoll requests returned" situation (see
+// struct schedi_job_epoll_requests_list) is controlled separately,
+// independent of the ready state. Only when both are satisfied does
+// schedi_job_setready_controlled() flag READY and signal readyjob_cond.
 
 #define SCHEDI_JOB_METAFLAG_GETACCESS(x)	(((x)>>28)&0b1111)
 #define SCHEDI_JOB_METAFLAG_SETACCESS(x, acc)	x = ((acc)<<28) | ((x)&(~(0b1111<<28)))
@@ -63,41 +70,48 @@ typedef int (*schedi_job_fn)(struct schedi_job *job);
 /**
  * struct schedi_job_epoll_request - One FD the main epoll is watching for a
  * job.
- * @node: Intrusive list node, chained into the owner's epoll_list. Must be
- *        the first field (offset 0) so the unified list functions work.
  * @socketfd: The file descriptor.
- * @owner: Back-pointer to the job that registered this request.
+ * @owner: Back-pointer to the job slot that registered this request.
+ * @job_gen: The owner's generation captured at registration time.
  * @list: Direct pointer to the owner's epoll_requests_list.
  *
  * The main epoll loop stores a pointer to this struct in
- * epoll_event.data.ptr. When epoll_wait returns, it locks the list's mutex,
- * checks @owner: if NULL the request is stale; otherwise it unlinks the
- * request via schedi_list_remove, updates counters, and unlocks.
+ * epoll_event.data.ptr. When epoll_wait returns, the loop calls
+ * schedi_job_epoll_request_return. Staleness is detected with the
+ * generation: the owner slot (a stable address in the static job array)
+ * is marked with access, then @job_gen is compared against the slot's
+ * current gen. A mismatch means the slot was torn down and possibly
+ * reused — the request is stale and is ignored. The slot's gen is
+ * incremented on every destroy, so a recycled slot can never match.
  */
 struct schedi_job_epoll_request {
-	struct schedi_list_node node;
 	int socketfd;
-	_Atomic(void *) owner; uint64_t job_gen;
+	_Atomic(void *) owner;
+	uint64_t job_gen;
 	struct schedi_job_epoll_requests_list *list;
 };
 
 /**
- * struct schedi_job_epoll_requests_list - Tracks epoll requests for one job.
- * @lock: Protects all list operations (add, remove, clear, owner check).
- * @list: Unified intrusive list head (schedi_list_node chain).
+ * struct schedi_job_epoll_requests_list - Tracks epoll request counters for
+ * one job.
  * @total_req: Total requests ever added (monotonic, never decremented).
  * @waiting_count: Requests currently outstanding.
  * @ret_count: Requests returned successfully.
  * @err_count: Requests returned with epoll error.
  *
- * All modifications to the list (add, remove, return) happen under @lock.
- * schedi_job_epoll_request_return locks @lock, checks @owner, unlinks the
- * request, decrements waiting_count, and updates ret_count/err_count.
- * A job is resumable once waiting_count == 0.
+ * schedi_job_tool_epoll increments total_req and waiting_count.
+ * schedi_job_epoll_request_return decrements waiting_count and increments
+ * ret_count (or err_count on error). A job is resumable once
+ * waiting_count == 0.
+ *
+ * waiting_count == 0 indicates the "epoll requests ready" (EPOLLREQ_READY)
+ * situation. This is independent of the job's READY state and is controlled
+ * separately: it is NOT a meta_flag, and setting the job READY must not be
+ * done from here directly — the readiness check goes through
+ * schedi_job_setready_controlled(), which consults both READYBASIC and
+ * this list's waiting_count before flagging READY.
  */
 struct schedi_job_epoll_requests_list {
-	pthread_mutex_t lock;
-	struct schedi_list list;
 	_Atomic unsigned int total_req;
 	_Atomic unsigned int waiting_count;
 	_Atomic unsigned int ret_count;
@@ -312,13 +326,15 @@ void schedi_ready_jobs_cache_reorganize_tick();
  * @req: The request that triggered the event.
  * @error: Non-zero if epoll returned EPOLLERR or EPOLLHUP for this fd.
  *
- * Locks the owning list's mutex, checks if @req->owner is alive, removes
- * the request from the job's epoll_list via schedi_list_remove, decrements
- * waiting_count, and increments ret_count (or err_count when @error is
- * set). If @req->owner is NULL the request is stale and the function does
- * nothing.
+ * Marks the request's owner slot with access (bails immediately if that
+ * fails, e.g. the slot is UNSTABLE), then compares @req->job_gen against
+ * the slot's current gen. If they differ the slot was torn down and
+ * possibly reused — the request is stale and this does nothing. Otherwise
+ * it decrements waiting_count and increments ret_count (or err_count when
+ * @error is set). If waiting_count reaches 0 it calls
+ * schedi_job_setready_controlled(owner).
  *
- * Return: 0 on success, -1 if owner is destroyed.
+ * Return: 0 on success, -1 if the request is stale or the owner is busy.
  */
 int schedi_job_epoll_request_return(struct schedi_job_epoll_request *req, int error);
 
@@ -339,11 +355,12 @@ int schedi_job_epoll_socket_return(struct schedi_job_epoll_socket* sock, int eve
  * @socketfd: File descriptor to watch.
  * @events: Epoll event mask (EPOLLIN | EPOLLET | ...).
  *
- * Allocates an schedi_job_epoll_request, links it into the job's epoll_list,
- * increments waiting_count, and registers the fd via schedi_epoll_add.
- * When the fd fires, the main loop calls schedi_job_epoll_request_return
- * which updates ret_count/err_count and decrements waiting_count.
- * The job resumes once waiting_count == 0.
+ * Allocates an schedi_job_epoll_request, captures the job's generation into
+ * req->job_gen, increments total_req and waiting_count, and registers the
+ * fd via schedi_epoll_add. When the fd fires, the main loop calls
+ * schedi_job_epoll_request_return which updates ret_count/err_count and
+ * decrements waiting_count. The job resumes once waiting_count == 0 (and
+ * READYBASIC is set).
  * 
  * Obviously needs "access" or "execution" flag on. And I recommend this being
  * called inside a job execution thus providing only 1 thread at 1 time.
@@ -547,7 +564,7 @@ unsigned int schedi_job_unmark_access(struct schedi_job *job);
  * schedi_job_mark_ready() - Triggered by the stuff that job is waiting for.
  * @job: The job's pointer.
  * 
- * Fails if UNSTABLE and WLLDESTROY is set.
+ * Fails if READY, UNSTABLE or WLLDESTROY is set.
  * 
  * Return: 0 on success, banned flags if banneds encountered.
  */
@@ -562,6 +579,37 @@ unsigned int schedi_job_mark_ready(struct schedi_job* job);
  * Return: 0 on success, banned flags if banneds encountered.
  */
 unsigned int schedi_job_unmark_ready(struct schedi_job* job);
+
+/** 
+ * schedi_job_mark_readybasic() - Mark the job's basic readiness.
+ * @job: The job's pointer.
+ * 
+ * Sets SCHEDI_JOB_METAFLAG_READYBASIC: the job is at rest and wanted to
+ * be run again. Set by the worker automatically after the job function
+ * returns 1, or "outside of the system" by the job's owner after a return
+ * 0 to resume the job under user control. READY is not flagged directly
+ * from here — the job still needs its epoll requests to have all returned,
+ * which is controlled separately by the epoll_requests_list.
+ * schedi_job_setready_controlled() consults both.
+ * 
+ * Fails if UNSTABLE and WLLDESTROY is set.
+ * 
+ * Return: 0 on success, banned flags if banneds encountered.
+ */
+unsigned int schedi_job_mark_readybasic(struct schedi_job* job);
+
+/** 
+ * schedi_job_unmark_readybasic() - Clear the job's basic readiness.
+ * @job: The job's pointer.
+ * 
+ * Clears SCHEDI_JOB_METAFLAG_READYBASIC. Triggered when the job is picked
+ * up and starts being executed.
+ * 
+ * Fails if UNSTABLE and WLLDESTROY is set.
+ * 
+ * Return: 0 on success, banned flags if banneds encountered.
+ */
+unsigned int schedi_job_unmark_readybasic(struct schedi_job* job);
 
 /**
  * schedi_job_create() - Allocate and initialise a new job slot.
@@ -645,6 +693,26 @@ void schedi_pickedreadyjob();
 int schedi_job_setready(struct schedi_job* job);
 
 /**
+ * schedi_job_setready_controlled() - Sets job ready if the controlled
+ * readiness conditions are met.
+ * @job: The job's pointer.
+ * 
+ * Sets the job READY (via schedi_job_setready) only when both of the
+ * following hold:
+ * 1. SCHEDI_JOB_METAFLAG_READYBASIC is set — the job function returned
+ *    1 and the job is at rest.
+ * 2. epoll_list->waiting_count == 0 — every epoll request has returned
+ *    (the EPOLLREQ_READY situation, controlled separately).
+ * 
+ * If either condition is unmet, the job is left untouched and this returns
+ * non-zero so the missing side can retry later.
+ * 
+ * Return: 0 on success, non-zero if a controlled condition was not met or
+ * schedi_job_setready failed.
+ */
+int schedi_job_setready_controlled(struct schedi_job* job);
+
+/**
  * schedi_completion_indicator_init() - Initializes the indicator.
  */
 
@@ -678,11 +746,10 @@ void schedi_job_completion_wait(struct schedi_job_completion_indicator* indicato
 
 /**
  * schedi_job_epoll_requests_list_new() - Allocate and initialise an epoll
- * list.
+ * requests list.
  *
- * Allocates a struct schedi_job_epoll_requests_list on the heap, initialises
- * the mutex, zeroes the list head via schedi_list_init, and sets
- * waiting_count, ret_count, err_count to 0.
+ * Allocates a struct schedi_job_epoll_requests_list on the heap and zeroes
+ * the request counters.
  *
  * The caller must call schedi_job_epoll_requests_list_destroy() to tear it
  * down.
@@ -692,36 +759,16 @@ void schedi_job_completion_wait(struct schedi_job_completion_indicator* indicato
 struct schedi_job_epoll_requests_list *schedi_job_epoll_requests_list_new(void);
 
 /**
- * schedi_job_epoll_requests_list_destroy() - De-initialise and free an epoll
- * list.
+ * schedi_job_epoll_requests_list_destroy() - Free an epoll requests list.
  * @list: Pointer to a struct schedi_job_epoll_requests_list previously
  *        returned by schedi_job_epoll_requests_list_new().
  *
- * Locks the list, NULLs all request owners via atomic store, destroys
- * the mutex, and calls free() on @list. The caller must not access @list
- * after this call.
+ * Frees @list. Outstanding schedi_job_epoll_request owners are not
+ * invalidated here — stale requests are detected by generation mismatch
+ * (req->job_gen vs. the slot's gen) in schedi_job_epoll_request_return.
+ * The caller must not access @list after this call.
  */
 void schedi_job_epoll_requests_list_destroy(struct schedi_job_epoll_requests_list *list);
-
-/**
- * schedi_job_epoll_list_add() - Push a request onto a job's epoll_list.
- * @job: The job that owns the list.
- * @req: The request to add.
- *
- * Links @req at the end of @job->epoll_list under the list lock.
- * Increments total_req and waiting_count.
- */
-void schedi_job_epoll_list_add(struct schedi_job *job, struct schedi_job_epoll_request *req);
-
-/**
- * schedi_job_epoll_list_remove() - Remove a request from a job's epoll_list.
- * @job: The job that owns the list.
- * @req: The request to remove.
- *
- * Unlinks @req from @job->epoll_list under the list lock.
- * Decrements waiting_count.
- */
-void schedi_job_epoll_list_remove(struct schedi_job *job, struct schedi_job_epoll_request *req);
 
 /**
  * schedi_job_destroy_now() - Internal teardown.
