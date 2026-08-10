@@ -1,6 +1,6 @@
 ## schedi
 
-schedi is a asynchronous multi-thread job scheduling and executing
+schedi is an asynchronous multi-thread job scheduling and executing
 system/library.
 
 Currently there's flaws but gonna talk about it and publish the current
@@ -23,7 +23,8 @@ To compile it as a static library inside the schedi folder
 make lib
 ```
 
-then a source named ```program.c``` with if schedi is at folder ```schedi```:
+then a source named ```program.c```, if schedi is at folder ```schedi```,
+with:
 
 ```bash
 gcc -I schedi/include program.c schedi/libschedi.a -pthread
@@ -38,7 +39,7 @@ being built.
 
 ##### LOCKLESS_READYJOB
 
-Define this on compilation to not put workers to sleep when they didnt 
+Define this on compilation to not put workers to sleep when they didn't 
 found a job. Normally workers sleep until there is a job. This sleep 
 approach depends heavily on mutexes. For constantly checking if theres 
 a job or not and use lockless ready job caches etc, use this.
@@ -63,7 +64,8 @@ if(schedi_worker_init(16)) {
 ```
 
 In the end, they should be deinitialized. Worker should be deinitialized
-first because workers could be using a job while we deinitialize the jobs.
+first because a worker could be using a job while on deinitialization of 
+jobs.
 
 ```C
 if(schedi_worker_deinit()) {
@@ -127,11 +129,18 @@ int example_job_function (struct schedi_job* job)
 
 	}
 
-	return 1; 	// returnin 1 makes job be ready for the next call immediately.
+	return 1; 	// returning 1 makes READYBASIC marked immediately after exiting
+                // the function. If everything else is ready (such as requests
+                // of the epoll tool), job will be ready to proceed further and 
+                // will be called again on the closest time.
 
-	return 0;	// returning 0 means "do not set it ready after executing."
-				// this is used when job's readiness would be triggered by
-				// something else, such as epoll tool.
+	return 0;	// returning 0 makes READYBASIC not marked. Returning 0 can be
+                // used to make job depend on something out of the system and
+                // triggering from outside of schedi. schedi_job_setready_controlled()
+                // should be called if that's the case after marking READYBASIC
+                // from outside. This function does the appropriate checks and
+                // sets job completely ready if everything else is OK. epoll tool
+                // etc. does the same call too.
 }
 ```
 
@@ -148,12 +157,16 @@ Instead of NULL there, you can pass a function ```void dtor(void*context);```
 that will be called on destruction. This function will get the context as parameter 
 and could be used for destruction of context.
 
-For make job start running, it should be setted ready. When a job is ready, a worker
+To make job start running, it should be setted ready. When a job is ready, a worker
 that is empty and waiting or searching for work will get this job and execute it.
 
 ```C
 schedi_job_setready(job);
 ```
+
+If getting generation id of job is wanted, getting the generation id before
+```schedi_job_setready()``` call is advised and otherwise job would start
+being processed and job generation id could be inconsistent.
 
 
 #### Initializing Indicator and Waiting for Indication
@@ -183,7 +196,7 @@ schedi_job_completion_wait(&indicator);
 
 #### Epoll Tool
 
-On job ```job```, if a file descriptor ```fd``` for epoll event ```EPOLLIN```,
+On job ```job```, if a file descriptor ```fd``` for epoll event ```EPOLLIN``` wanted,
 this call can be made inside of job function.
 
 ```C
@@ -191,8 +204,7 @@ schedi_job_tool_epoll(job, fd, EPOLLIN);
 ```
 
 Then when the epoll loop gets triggered with ```EPOLLIN``` for the file descriptor
-```fd```, job will be setted ready. For this to work, job function should return 0
-after epoll tool calls.
+```fd```, job will be setted ready.
 
 
 #### Details on Destruction
@@ -209,8 +221,8 @@ pointer, every gen represents a unique job.
 
 schedi's intention is to get a beautiful asynchronous execution with different
 jobs. But as a side effect, performance can also be gained by seperating a job
-that has some independent parts from each other and execute flawlessly to 
-jobs and executing them asynchronously.
+that has some independent parts from each other and could execute flawlessly as 
+seperated jobs with executing them asynchronously.
 
 #### 100 Million Double Vector Randomization and Dot Product
 
@@ -269,8 +281,6 @@ once.
 
 When dividing the job more than 2 jobs and initializing same amount of threads,
 single-thread calculation is generally faster.
-
-#### epoll tool race with returning 0 on job function (solved)
 
 #### one time epoll
 
