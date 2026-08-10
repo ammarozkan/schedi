@@ -224,6 +224,8 @@ jobs. But as a side effect, performance can also be gained by seperating a job
 that has some independent parts from each other and could execute flawlessly as 
 seperated jobs with executing them asynchronously.
 
+Tests has ben made with Ryzen 5 2600 CPU.
+
 #### 100 Million Double Vector Randomization and Dot Product
 
 Problem is setting a vector on two seperate arrays and making a dot product
@@ -245,30 +247,30 @@ I did 4 tests with
 time ./bin/aparalleljob ; time ./bin/aparalleljob_mono
 ```
 
-and on avarage of 45% with 0.9 standard deviation gain has been made
+and on avarage of 45% (with 0.9 standard deviation) gain has been made
 on time with 2 thread 2 jobs.
 
 ##### same with 3 thread, 3 job
 
 Interestingly the same 4 tests resulted with 38.8% increase on
-time with 14.2 standard deviation. I think there's a collision
+time (with 14.2 standard deviation). I think there's a collision
 of threads or something like that.
 
 ##### same with 4 thread, 4 job
 
-55% increase on time with 15.7 standard deviation.
+55% increase on time (with 15.7 standard deviation).
 
 #### same with 6 thread, 6 job
 
-32% increase on time with 9.9 standard deviation.
+32% increase on time (with 9.9 standard deviation).
 
 #### same with 12 thread, 12 job
 
-15.5% increase on time with 4.3 standard deviation.
+15.5% increase on time (with 4.3 standard deviation).
 
 #### same with 24 thread, 24 job
 
-46% increase on time with 14 standard deviation.
+46% increase on time (with 14 standard deviation).
 
 Also there was a case with 145% increase on time but only occured
 once.
