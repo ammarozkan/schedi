@@ -501,7 +501,8 @@ unsigned int schedi_job_mark_or(struct schedi_job* job, unsigned int flag, unsig
 	while( !(ban = (meta_flag & banned_flags) | ((-(int)ban_access) & (meta_flag & SCHEDI_JOB_METAFLAG_ACCESS))) ) {
 		desired = meta_flag | flag;
 
-		if(!atomic_compare_exchange_strong(&(job->meta_flag), &meta_flag, desired))
+		if(!atomic_compare_exchange_strong_explicit(&(job->meta_flag), &meta_flag, desired, 
+					memory_order_release, memory_order_relaxed))
 			return 0;
 	}
 
@@ -522,7 +523,8 @@ unsigned int schedi_job_unmark_or(struct schedi_job* job, unsigned int flag, uns
 		&& meta_flag & flag) {
 		desired = meta_flag & (~flag);
 
-		if(!atomic_compare_exchange_strong(&(job->meta_flag), &meta_flag, desired))
+		if(!atomic_compare_exchange_strong_explicit(&(job->meta_flag), &meta_flag, desired, 
+					memory_order_release, memory_order_relaxed))
 			return 0;
 	}
 
@@ -650,6 +652,21 @@ unsigned int schedi_job_unmark_readybasic(struct schedi_job* job)
 }
 
 
+unsigned int schedi_job_mark_readyepollsock(struct schedi_job* job)
+{
+	return schedi_job_mark_or(job, SCHEDI_JOB_METAFLAG_READYEPOLLSOCK, 
+		SCHEDI_JOB_METAFLAG_UNSTABLE | 
+		SCHEDI_JOB_METAFLAG_WLLDESTROY, false);
+}
+
+unsigned int schedi_job_unmark_readyepollsock(struct schedi_job* job)
+{
+	return schedi_job_unmark_or(job, SCHEDI_JOB_METAFLAG_READYEPOLLSOCK, 
+		SCHEDI_JOB_METAFLAG_UNSTABLE | 
+		SCHEDI_JOB_METAFLAG_WLLDESTROY, false);
+}
+
+
 // tries destroying now. if nothing else playing with the data, will succesfully
 // destroy it.
 // returns 0 on failure
@@ -750,24 +767,6 @@ int schedi_job_epoll_request_return(struct schedi_job_epoll_request *req, int er
 }
 
 
-int schedi_job_epoll_socket_return(struct schedi_job_epoll_socket* req, int events)
-{
-	// applies 
-
-	return 1;
-}
-
-/**
- * schedi_job_epoll_socket_condition() - Being called by epoll loop when socket
- * is died or condition is hitted.
- */
-
-int schedi_job_epoll_socket_condition(struct schedi_job_epoll_socket *sock, int error)
-{
-	// future impl.
-	return 1;
-}
-
 int schedi_job_tool_epoll(struct schedi_job *job, int socketfd, uint32_t events)
 {
 	struct schedi_job_epoll_request *req = malloc(sizeof(*req));
@@ -821,6 +820,42 @@ void schedi_job_epoll_requests_list_destroy(struct schedi_job_epoll_requests_lis
 	free(list);
 }
 
+
+int schedi_job_epoll_socket_return(struct schedi_job_epoll_socket* req, int events)
+{
+	// applies
+	
+	// do the action depending on event and use buffers. read with an amount of what
+	// space being left on the buffer. then return.
+
+	return 1;
+}
+
+int schedi_job_tool_epollsocket_done(struct schedi_job_epoll_socket* _socket)
+{
+	int p = atomic_fetch_sub(&_socket->fall, 1);
+	if(p == 1) {
+		// this call made the _socket->fall zero.
+		// so let it burn.
+		free(_socket);
+		return 1;
+	}
+
+	return 0;
+}
+
+int schedi_job_epoll_socket_write(struct schedi_job_epoll_socket* _socket,
+		char* data, size_t size)
+{
+}
+
+int schedi_job_epoll_socket_read(struct schedi_job_epoll_socket* _socket,
+		char* data, size_t size)
+{
+}
+
+
+
 struct schedi_job *schedi_job_create(void *context, schedi_job_fn run,
                                      void (*dtor)(void *context))
 {
@@ -835,6 +870,13 @@ struct schedi_job *schedi_job_create(void *context, schedi_job_fn run,
 	job->run = run;
 	job->dtor = dtor;
 	job->epoll_list = schedi_job_epoll_requests_list_new();
+
+	for(unsigned int i = 0 ; 
+			i < SCHEDI_JOBS_TOOL_EPOLLSOCKET_COUNT ; i += 1) {
+		job->epoll_sockets[i] = NULL;
+	}
+	job->required_available_sockets = 0;
+	
 
 	atomic_store_explicit(&(job->meta_flag), SCHEDI_JOB_METAFLAG_ALIVE, memory_order_release);
 
@@ -877,16 +919,6 @@ _pop_pick:
 	return job;
 }
 
-int schedi_job_setready_controlled(struct schedi_job* job)
-{
-	uint32_t meta_flag = atomic_load_explicit(&(job->meta_flag), memory_order_acquire);
-	if(!(meta_flag & SCHEDI_JOB_METAFLAG_READYBASIC))
-		return 1;
-	if(job->epoll_list->waiting_count != 0)
-		return 1;
-
-	return schedi_job_setready(job);
-}
 
 
 int schedi_job_setready(struct schedi_job* job)
@@ -912,6 +944,42 @@ int schedi_job_setready(struct schedi_job* job)
 
 	return ret;
 }
+
+
+
+int schedi_job_setready_controlled(struct schedi_job* job)
+{
+	uint32_t meta_flag = atomic_load_explicit(&(job->meta_flag), memory_order_acquire);
+	if(!(meta_flag & SCHEDI_JOB_METAFLAG_READYBASIC))
+		return 1;
+	if(job->epoll_list->waiting_count != 0)
+		return 1;
+
+	return schedi_job_setready(job);
+}
+
+
+int schedi_job_refresh_epollsocket_ready(struct schedi_job* job)
+{
+	int ready_sockets = 0;
+	for(unsigned int i = 0 ; i < SCHEDI_JOBS_TOOL_EPOLLSOCKET_COUNT ;
+			i += 1) {
+		if(!job->epoll_sockets[i]) continue;
+		if(job->epoll_sockets[i]->htc & SCHEDI_JOB_EPOLL_SOCKET_READY)
+			ready_sockets += 1;
+	}
+
+	if (ready_sockets >= job->required_available_sockets) {
+		return (int)schedi_job_mark_readyepollsock(job);
+	} else {
+		return (int)schedi_job_unmark_readyepollsock(job);
+	}
+}
+
+
+
+
+
 
 void schedi_completion_indicator_init(struct schedi_job_completion_indicator* indicator)
 {

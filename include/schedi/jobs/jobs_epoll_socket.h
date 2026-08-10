@@ -10,14 +10,23 @@
 
 #define SCHEDI_JOB_EPOLL_SOCKET_READY (1<<15)
 
+#define SCHEDI_JOB_EPOLL_SOCKET_BUFFERSIZE 1024
+
+
+/**
+ * struct schedi_job_epoll_socket - Instance of an schedi epoll socket.
+ */
 
 struct schedi_job_epoll_socket {
 	int fd;
 	_Atomic uint64_t htc; 	// highest 16 is head, then tail, then count, then 1 bit indicates if its ready
 							// or not. Last 15 is label.
-	char buffer[1024];
+	char buffer[SCHEDI_JOB_EPOLL_SOCKET_BUFFERSIZE];
 	_Atomic uint32_t count_condition;	// when count passes this,
-										// the socket will be ready
+						// the socket will be ready.
+						// It cannot be above 
+						// SCHEDI_JOB_EPOLL_SOCKET_BUFFERSIZE
+						// If it is, then its undefined behaviour.
 };
 
 

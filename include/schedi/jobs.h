@@ -7,13 +7,15 @@
 #include <stdbool.h>
 
 #include <schedi/list.h>
-#include <schedi/jobs/jobs_epoll_socket.h>
 
 #define SCHEDI_MAXIMUM_JOBS (256)
 #define SCHEDI_MAXIMUM_EMPTY_SECTIONS (64)
 
 // only first SCHEDI_JOBS_CACHE_CHECK of ready jobs cache is checked on quick checks.
 #define SCHEDI_JOBS_CACHE_CHECK 16
+
+#define SCHEDI_JOBS_TOOL_EPOLLSOCKET_COUNT 2
+#define SCHEDI_JOB_EPOLL_SOCKET_BUFFERSIZE 1024
 
 /**
  * enum schedi_job_state - Represents a state of a job.
@@ -39,6 +41,7 @@ enum schedi_job_state {
 #define SCHEDI_JOB_METAFLAG_DESTROYNOTENT	(1<<4) // job couldnt pushed to the destroy queue. its full.
 #define SCHEDI_JOB_METAFLAG_READY			(1<<5) // ready to execute
 #define SCHEDI_JOB_METAFLAG_READYBASIC		(1<<6) // job function returned, wants to be run again
+#define SCHEDI_JOB_METAFLAG_READYEPOLLSOCK	(1<<7) // readiness of epoll sockets.
 
 // READY is the "last thing" and should be the only flag the readyjob_mutex
 // + readyjob_cond machinery watches. READYBASIC means the job is at rest
@@ -118,6 +121,30 @@ struct schedi_job_epoll_requests_list {
 	_Atomic unsigned int err_count;
 };
 
+#define SCHEDI_JOB_EPOLL_SOCKET_READY (1<<15)
+
+struct schedi_job_epoll_socket {
+	int fd;
+	_Atomic uint64_t htc; // highest 16 is head, then tail, then count, then 1 bit
+			      // indicates if its ready or not. Least 15 is label.
+	
+	char read_buffer[SCHEDI_JOB_EPOLL_SOCKET_BUFFERSIZE];
+	_Atomic uint32_t read_count_condition;	// when count passes this,
+						// the socket will be ready.
+						// It cannot be above
+						// SCHEDI_JOB_EPOLL_SOCKET_BUFFERSIZE
+						// If it is, then its undefined
+						// behaviour.
+	char write_buffer[SCHEDI_JOB_EPOLL_SOCKET_BUFFERSIZE];
+	_Atomic uint32_t write_buffer_condition; // when there is that amount of
+						 // space available to write, the
+						 // socket will be ready.
+
+	_Atomic int fall;	// this is 2 on start. when epoll system epoll_ctl_dels this,
+				// it will decrease. When job function decides its over, it
+				// will decrease this too. The first one that decreases it from
+				// 1 will free this.
+};
 
 
 
@@ -209,6 +236,16 @@ struct schedi_job {
 	_Atomic uint32_t meta_flag;
 
 	struct schedi_job_epoll_requests_list *epoll_list;
+
+	// epoll sockets will be checked individually and counted if they are
+	// ready or not. if ready socket count exceeds required_available_sockets,
+	// READYEPOLLSOCK will be marked. On start, that requirement is zero and
+	// that is marked by default. Use of epoll sockets will mark/unmark 
+	// this depending to the ready socket count and increasing that 
+	// requirement manually is required. Also epoll system does those checks
+	// too.
+	struct schedi_job_epoll_socket *epoll_sockets[SCHEDI_JOBS_TOOL_EPOLLSOCKET_COUNT];
+	int required_available_sockets;
 
 	struct schedi_job_request *request_from;
 
@@ -368,6 +405,38 @@ int schedi_job_epoll_socket_return(struct schedi_job_epoll_socket* sock, int eve
  * Return: 0 on success, lower than zero on error.
  */
 int schedi_job_tool_epoll(struct schedi_job *job, int socketfd, uint32_t events);
+
+/**
+ * schedi_job_tool_epollsocket() - Assigns a socket as schedi epoll socket.
+ *
+ * Return: Returns the associated socket on success, NULL on failure. On
+ * exit of job, schedi_job_tool_epollsocket_done() should be called on this to
+ * indicate that job does not need that socket anymore.
+ */
+struct schedi_job_epoll_socket* 
+schedi_job_tool_epollsocket(struct schedi_job *job, int socketfd);
+
+/**
+ * schedi_job_tool_epollsocket_done() - Indicates epollsocket usage is over.
+ *
+ * This function is called from epoll system and jobs itself. The last one
+ * calling this function will be freeing the socket.
+ *
+ * Using fetch_sub == 1 check.
+ */
+int schedi_job_tool_epollsocket_done(struct schedi_job_epoll_socket*);
+
+int schedi_job_epoll_socket_write(struct schedi_job_epoll_socket* socket, 
+		char* data, size_t size);
+int schedi_job_epoll_socket_read(struct schedi_job_epoll_socket* socket, 
+		char* data, size_t size);
+
+/**
+ * schedi_job_epoll_socket_refresh() - Refreshes the readiness state.
+ */
+int schedi_job_epoll_socket_refresh(struct schedi_job_epoll_socket* socket);
+
+
 
 /**
  * schedi_job_init() - Pre-initialise the array and cond_t.
@@ -610,6 +679,37 @@ unsigned int schedi_job_mark_readybasic(struct schedi_job* job);
  * Return: 0 on success, banned flags if banneds encountered.
  */
 unsigned int schedi_job_unmark_readybasic(struct schedi_job* job);
+/** 
+ * schedi_job_mark_readyepollsock() - Mark the job's epoll socket readiness.
+ * @job: The job's pointer.
+ * 
+ * Sets SCHEDI_JOB_METAFLAG_READYEPOLLSOCK: the job's registered epoll
+ * sockets have reached the required readiness. The marking is done by the
+ * epoll system and by the epoll_socket operations (the read and write
+ * calls): each socket caches its readiness as a bit flag
+ * (SCHEDI_JOB_EPOLL_SOCKET_READY within its htc), and when the ready
+ * socket count reaches required_available_sockets the flag is marked.
+ * schedi_job_refresh_epollsocket_ready() performs that check.
+ * 
+ * Fails if UNSTABLE and WLLDESTROY is set.
+ * 
+ * Return: 0 on success, banned flags if banneds encountered.
+ */
+unsigned int schedi_job_mark_readyepollsock(struct schedi_job* job);
+
+/** 
+ * schedi_job_unmark_readyepollsock() - Clear the job's epoll socket
+ * readiness.
+ * @job: The job's pointer.
+ * 
+ * Clears SCHEDI_JOB_METAFLAG_READYEPOLLSOCK. Triggered when the ready
+ * socket count drops below required_available_sockets.
+ * 
+ * Fails if UNSTABLE and WLLDESTROY is set.
+ * 
+ * Return: 0 on success, banned flags if banneds encountered.
+ */
+unsigned int schedi_job_unmark_readyepollsock(struct schedi_job* job);
 
 /**
  * schedi_job_create() - Allocate and initialise a new job slot.
@@ -691,6 +791,14 @@ void schedi_pickedreadyjob();
  */
 
 int schedi_job_setready(struct schedi_job* job);
+
+/**
+ * schedi_job_refresh_epollsocket_ready() - Refreshes readiness of epollsocket.
+ * @job: Job to be refreshed.
+ *
+ * Return: 0 on success, non-0 on failure.
+ */
+int schedi_job_refresh_epollsocket_ready(struct schedi_job* job);
 
 /**
  * schedi_job_setready_controlled() - Sets job ready if the controlled

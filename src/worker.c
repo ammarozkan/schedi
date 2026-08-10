@@ -77,8 +77,8 @@ static void *worker_routine(void *arg)
 _got_a_job:
 		job->state = schedi_job_state_working;
 		if(schedi_job_mark_executing(job)) goto _continue; 	// somebody stole the job. ok.
-															// stealing is illegal so this
-															// check can be removed.
+									// as stealing is illegal, this
+									// check can be removed.
 		schedi_job_unmark_access(job);	// holding the access from pickready.
 		int ret = job->run(job);
 		schedi_job_unmark_executing(job); 	// as we success marking execute,
