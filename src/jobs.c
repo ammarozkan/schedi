@@ -1,10 +1,12 @@
 #include <schedi/jobs.h>
 #include <schedi/epoll.h>
+#include <schedi/log.h>
 #include <errno.h>
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <stdbool.h>
-#include <schedi/log.h>
+#include <sys/socket.h>
+#include <string.h>
 
 /*
  * Destroy Queue
@@ -24,98 +26,120 @@
 static struct {
 	struct schedi_job *buf[SCHEDI_DQ_SIZE];
 	_Atomic bool ready[SCHEDI_DQ_SIZE];
-	_Atomic long long htc;	// contains head (first 16), tail (16), count (high 16). Rest highest 16 is label
-							// for preventing ABA problem on really high amount of work in a little time.
-							// its really a low chance (65536 push and pop while CAS loop calculating!) but
-							// extra protection.
+	_Atomic long long htc;	// contains head (first 16), tail (16), 
+				// count (high 16). Rest highest 16 is label
+				// for preventing ABA problem on really high 
+				// amount of work in a little time.
+				// its really a low chance (65536 push and pop 
+				// while CAS loop calculating!) but
+				// extra protection.
 } dq;
 
 _Static_assert(ATOMIC_LLONG_LOCK_FREE == 2, "CPU with lockless atomic long long support would be great.");
 
+static size_t min(size_t a, size_t b)
+{
+	return a < b ? a : b;
+}
+
+
 #define _BITS16 0b1111111111111111
 #define BITS16(x) ((long long)_BITS16<<((x)*16))
+
+#define HTC_HEAD(x) (x >> 48 & (long long)0xFFFF)
+#define HTC_TAIL(x) (x >> 32 & (long long)0xFFFF)
+#define HTC_COUNT(x) (x >> 16 & (long long)0xFFFF)
+#define HTC_LABEL15(x) (x & (long long)0x7FFF)		// for 15 bit label
+#define HTC_LABEL(x) (x & (long long)0xFFFF)		// 16 bit label
 
 struct HTC {
 	uint32_t head, tail, count, label;
 };
 
-#define PACK_HTC(htc) ((long long)(htc).head | (long long)(htc).tail << 16 | (long long)(htc).count << 32 | (long long)(htc).label << 48)
+#define PACK_HTC(htc) ((long long)(htc).head << 48 | (long long)(htc).tail << 32 | \
+		(long long)(htc).count << 16 | (long long)(htc).label << 0)
 #define UNPACK_HTC(htc) ((struct HTC){ 	\
-	.head = (uint32_t)((htc) >> 0) & BITS16(0), 	\
-	.tail = (uint32_t)((htc) >> 16) & BITS16(0), 	\
-	.count = (uint32_t)((htc) >> 32) & BITS16(0), 	\
-	.label = (uint32_t)((htc) >> 48) & BITS16(0)} 	\
+	.head = (uint32_t)((htc) >> 48) & BITS16(0), 	\
+	.tail = (uint32_t)((htc) >> 32) & BITS16(0), 	\
+	.count = (uint32_t)((htc) >> 16) & BITS16(0), 	\
+	.label = (uint32_t)((htc) >> 0) & BITS16(0)} 	\
 )
 
 
 // returns -1 if queue is full
 // returns 0 in success
 
-#define DEFINE_DQ_PUSH_ATOMIC(name, super) 									\
-static int name(struct schedi_job *job) 									\
-{ 																			\
+#define DEFINE_DQ_PUSH_ATOMIC(name, super) 					\
+static int name(struct schedi_job *job) 					\
+{ 										\
 	long long htc = atomic_load_explicit(&dq.htc, memory_order_relaxed); 	\
-	long long desired; 														\
-																			\
-	struct HTC _htc, _des; 													\
-																			\
-																			\
-	do { 																	\
-		_htc = UNPACK_HTC(htc); 											\
-																			\
-		if (_htc.count >= SCHEDI_DQ_SIZE) return -1;						\
-																			\
-		_des = _htc; 														\
-		_des.head = (_htc.head + 1) % SCHEDI_DQ_SIZE; 						\
-		super; 																\
-																			\
-		/* doing something unique */										\
-		_des.label = (_des.label + 5 + 										\
-			((long long)job)%65200 + _des.head%5)%65536; 					\
-																			\
-		desired = PACK_HTC(_des); 											\
+	long long desired; 			\
+	struct HTC _htc, _des; 			\
+						\
+	do { 					\
+		_htc.count = HTC_COUNT(htc);	\
+						\
+		if (_htc.count >= SCHEDI_DQ_SIZE) return -1;				\
+		_htc.head = HTC_HEAD(htc);						\
+		_htc.tail = HTC_TAIL(htc);						\
+		_htc.label = HTC_LABEL(htc);						\
+											\
+		_des = _htc; 								\
+		_des.head = (_htc.head + 1) % SCHEDI_DQ_SIZE; 				\
+		super; 									\
+											\
+		/* doing something unique */						\
+		_des.label = (_des.label + 5 + 						\
+			((long long)job)%65200 + _des.head%5)%65536; 			\
+											\
+		desired = PACK_HTC(_des); 						\
 	} while(!atomic_compare_exchange_strong(&dq.htc, &htc, desired));		\
-																			\
-	dq.buf[_htc.head] = job;												\
-	atomic_store_explicit(&dq.ready[_htc.head], true, memory_order_release);\
-	return 0;																\
+											\
+	dq.buf[_htc.head] = job;							\
+	atomic_store_explicit(&dq.ready[_htc.head], true, memory_order_release);	\
+	return 0;									\
 }
 
 
 // returns NULL if theres no current pops ready.
 // returns 
 
-#define DEFINE_DQ_POP_ATOMIC(name, super)									\
-static struct schedi_job* name()											\
-{																			\
+#define DEFINE_DQ_POP_ATOMIC(name, super)					\
+static struct schedi_job* name()						\
+{										\
 	long long htc = atomic_load_explicit(&dq.htc, memory_order_relaxed);	\
-	long long desired;														\
-																			\
-	struct HTC _htc, _des;													\
-																			\
-																			\
-	do {																	\
-		_htc = UNPACK_HTC(htc);												\
-		bool ready = atomic_load_explicit(&dq.ready[_htc.tail], 			\
-			memory_order_acquire);											\
-																			\
-		if (_htc.count == 0 || !ready) return NULL;							\
-																			\
-		_des = _htc;														\
-		_des.tail = (_htc.tail + 1) % SCHEDI_DQ_SIZE;						\
-		super;																\
-																			\
-		/* lets do something unique */										\
-		_des.label = (_des.label + 3 + 										\
-			((long long)dq.buf[_htc.tail])%65200 + _des.head%5)%65536;		\
-																			\
-		desired = PACK_HTC(_des);											\
+	long long desired;							\
+										\
+	struct HTC _htc, _des;							\
+										\
+										\
+	do {									\
+		_htc.count = HTC_COUNT(htc);					\
+		_htc.tail = HTC_TAIL(htc);					\
+										\
+		bool ready = atomic_load_explicit(&dq.ready[_htc.tail], 	\
+			memory_order_acquire);					\
+										\
+		if (_htc.count == 0 || !ready) return NULL;			\
+										\
+		_htc.head = HTC_HEAD(htc);					\
+		_htc.label = HTC_LABEL(htc);					\
+										\
+		_des = _htc;							\
+		_des.tail = (_htc.tail + 1) % SCHEDI_DQ_SIZE;			\
+		super;								\
+										\
+		/* lets do something unique */						\
+		_des.label = (_des.label + 3 + 						\
+			((long long)dq.buf[_htc.tail])%65200 + _des.head%5)%65536;	\
+											\
+		desired = PACK_HTC(_des);						\
 	} while(!atomic_compare_exchange_strong(&dq.htc, &htc, desired));		\
-																			\
-	struct schedi_job* job = dq.buf[_htc.tail];								\
-	atomic_store_explicit(&dq.ready[_htc.tail], false, 						\
-		memory_order_release);												\
-	return job;																\
+											\
+	struct schedi_job* job = dq.buf[_htc.tail];					\
+	atomic_store_explicit(&dq.ready[_htc.tail], false, 				\
+		memory_order_release);							\
+	return job;									\
 }
 
 // defining both super and non super versions of the function here.
@@ -820,6 +844,217 @@ void schedi_job_epoll_requests_list_destroy(struct schedi_job_epoll_requests_lis
 	free(list);
 }
 
+static void schedi_job_epoll_socket_update_read_ready(
+		struct schedi_job_epoll_socket* _socket, uint32_t count)
+{
+	uint32_t condition = _socket->read_count_condition;
+	bool read_ready = count >= condition;
+	atomic_store_explicit(&_socket->read_ready, read_ready, memory_order_release);
+
+	bool write_ready = atomic_load_explicit(&_socket->write_ready,
+			memory_order_acquire);
+	atomic_store_explicit(&_socket->ready, read_ready && write_ready,
+			memory_order_release);
+}
+
+static void schedi_job_epoll_socket_update_write_ready(
+		struct schedi_job_epoll_socket* _socket, uint32_t avail)
+{
+	uint32_t condition = _socket->write_avail_condition;
+	bool write_ready = avail >= condition;
+	atomic_store_explicit(&_socket->write_ready, write_ready, memory_order_release);
+
+	bool read_ready = atomic_load_explicit(&_socket->read_ready,
+			memory_order_acquire);
+	atomic_store_explicit(&_socket->ready, read_ready && write_ready,
+			memory_order_release);
+}
+
+int schedi_job_epoll_socket_write(struct schedi_job_epoll_socket* _socket,
+		char* data, size_t size)
+{
+	int avail = atomic_load_explicit(&_socket->write_htc.avail, 
+			memory_order_acquire);
+	int head = atomic_load_explicit(&_socket->write_htc.head,
+			memory_order_acquire);
+	
+	size_t avail_size = avail;
+	size_t write_size = min(size, avail_size);
+
+	if(write_size + head >= SCHEDI_JOB_EPOLL_SOCKET_BUFFERSIZE) {
+		size_t fwrite = SCHEDI_JOB_EPOLL_SOCKET_BUFFERSIZE - head;
+		size_t rest_write = write_size - fwrite;
+		
+		memcpy(_socket->write_buffer + head, data, fwrite);
+		memcpy(_socket->write_buffer, data + fwrite, rest_write);
+		head = rest_write;
+	} else {
+		memcpy(_socket->write_buffer + head, data, write_size);
+		head = head + write_size;
+	}
+
+	size_t des_avail;
+	do {
+		des_avail = avail - write_size;
+	} while(!atomic_compare_exchange_strong_explicit(
+				&_socket->write_htc.avail, 
+				&avail, des_avail,
+				memory_order_release, memory_order_relaxed));
+
+	atomic_store(&_socket->write_htc.head, head);
+
+	schedi_job_epoll_socket_update_write_ready(_socket, des_avail);
+
+	return write_size;
+}
+
+int schedi_job_epoll_socket_read(struct schedi_job_epoll_socket* _socket,
+		char* data, size_t size)
+{
+	int count = atomic_load_explicit(&_socket->read_htc.count,
+			memory_order_acquire);
+	int tail = atomic_load_explicit(&_socket->read_htc.tail,
+			memory_order_acquire);
+
+	size_t count_size = count;
+	size_t read_size = min(count_size, size);
+
+	if(read_size + tail >= SCHEDI_JOB_EPOLL_SOCKET_BUFFERSIZE) {
+		size_t fread = SCHEDI_JOB_EPOLL_SOCKET_BUFFERSIZE - tail;
+		size_t rest_read = read_size - fread;
+
+		memcpy(_socket->read_buffer + tail, data, fread);
+		memcpy(_socket->read_buffer, data + fread, rest_read);
+		tail = rest_read;
+	} else {
+		memcpy(_socket->read_buffer + tail, data, read_size);
+		tail += read_size;
+	}
+
+	size_t des_count;
+	do {
+		des_count = count - read_size;
+	} while(!atomic_compare_exchange_strong_explicit(&_socket->read_htc.count,
+				&count, des_count,
+				memory_order_release, memory_order_relaxed));
+
+	atomic_store(&_socket->read_htc.tail, tail);
+
+	schedi_job_epoll_socket_update_read_ready(_socket, des_count);
+
+	return read_size;
+}
+
+int schedi_job_epoll_socket_write_return(struct schedi_job_epoll_socket* _socket)
+{
+	int tail = atomic_load_explicit(&_socket->write_htc.tail,
+			memory_order_acquire);
+	int avail = atomic_load_explicit(&_socket->write_htc.avail,
+			memory_order_acquire);
+
+	size_t sendable = SCHEDI_JOB_EPOLL_SOCKET_BUFFERSIZE - avail;
+	size_t total = 0;
+
+	if(sendable == 0)
+		return 0;
+
+	size_t first = min(sendable, SCHEDI_JOB_EPOLL_SOCKET_BUFFERSIZE - tail);
+
+	ssize_t sent = send(_socket->fd, _socket->write_buffer + tail,
+			first, MSG_NOSIGNAL);
+	if(sent < 0)
+		return -1;
+
+	total = sent;
+	tail = (tail + (int)sent) % SCHEDI_JOB_EPOLL_SOCKET_BUFFERSIZE;
+
+	if((size_t)sent == first && first < sendable) {
+		size_t rest_write = sendable - first;
+		ssize_t sent_rest = send(_socket->fd,
+				_socket->write_buffer,
+				rest_write, MSG_NOSIGNAL);
+		if(sent_rest > 0) {
+			total += sent_rest;
+			tail = (int)sent_rest;
+		}
+	}
+
+	int des_avail;
+	do {
+		des_avail = avail + (int)total;
+	} while(!atomic_compare_exchange_strong_explicit(
+				&_socket->write_htc.avail,
+				&avail, des_avail,
+				memory_order_release, memory_order_relaxed));
+
+	atomic_store(&_socket->write_htc.tail, tail);
+
+	schedi_job_epoll_socket_update_write_ready(_socket, des_avail);
+
+	return (int)total;
+}
+
+int schedi_job_epoll_socket_read_return(struct schedi_job_epoll_socket* _socket)
+{
+	int head = atomic_load_explicit(&_socket->read_htc.head,
+			memory_order_acquire);
+	int count = atomic_load_explicit(&_socket->read_htc.count,
+			memory_order_acquire);
+
+	size_t free = SCHEDI_JOB_EPOLL_SOCKET_BUFFERSIZE - count;
+	size_t total = 0;
+
+	if(free == 0)
+		return 0;
+
+	size_t first = min(free, SCHEDI_JOB_EPOLL_SOCKET_BUFFERSIZE - head);
+
+	ssize_t got = recv(_socket->fd, _socket->read_buffer + head,
+			first, 0);
+	if(got == 0)
+		return -1;
+	if(got < 0) {
+		if(errno == EAGAIN || errno == EWOULDBLOCK)
+			return 0;
+		return -1;
+	}
+
+	total = got;
+	head = (head + (int)got) % SCHEDI_JOB_EPOLL_SOCKET_BUFFERSIZE;
+
+	int dead = 0;
+
+	if((size_t)got == first && first < free) {
+		size_t rest_read = free - first;
+		ssize_t got_rest = recv(_socket->fd,
+				_socket->read_buffer,
+				rest_read, 0);
+		if(got_rest > 0) {
+			total += got_rest;
+			head = (int)got_rest;
+		} else if(got_rest == 0) {
+			dead = 1;
+		} else if(errno != EAGAIN && errno != EWOULDBLOCK) {
+			dead = 1;
+		}
+	}
+
+	int des_count;
+	do {
+		des_count = count + (int)total;
+	} while(!atomic_compare_exchange_strong_explicit(&_socket->read_htc.count,
+				&count, des_count,
+				memory_order_release, memory_order_relaxed));
+
+	atomic_store(&_socket->read_htc.head, head);
+
+	schedi_job_epoll_socket_update_read_ready(_socket, des_count);
+
+	if(dead)
+		return -1;
+
+	return (int)total;
+}
 
 int schedi_job_epoll_socket_return(struct schedi_job_epoll_socket* req, int events)
 {
@@ -843,17 +1078,6 @@ int schedi_job_tool_epollsocket_done(struct schedi_job_epoll_socket* _socket)
 
 	return 0;
 }
-
-int schedi_job_epoll_socket_write(struct schedi_job_epoll_socket* _socket,
-		char* data, size_t size)
-{
-}
-
-int schedi_job_epoll_socket_read(struct schedi_job_epoll_socket* _socket,
-		char* data, size_t size)
-{
-}
-
 
 
 struct schedi_job *schedi_job_create(void *context, schedi_job_fn run,
@@ -965,7 +1189,7 @@ int schedi_job_refresh_epollsocket_ready(struct schedi_job* job)
 	for(unsigned int i = 0 ; i < SCHEDI_JOBS_TOOL_EPOLLSOCKET_COUNT ;
 			i += 1) {
 		if(!job->epoll_sockets[i]) continue;
-		if(job->epoll_sockets[i]->htc & SCHEDI_JOB_EPOLL_SOCKET_READY)
+		if(job->epoll_sockets[i]->ready)
 			ready_sockets += 1;
 	}
 

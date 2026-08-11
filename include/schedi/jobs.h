@@ -121,22 +121,28 @@ struct schedi_job_epoll_requests_list {
 	_Atomic unsigned int err_count;
 };
 
-#define SCHEDI_JOB_EPOLL_SOCKET_READY (1<<15)
-
 struct schedi_job_epoll_socket {
 	int fd;
-	_Atomic uint64_t htc; // highest 16 is head, then tail, then count, then 1 bit
-			      // indicates if its ready or not. Least 15 is label.
-	
+	_Atomic bool ready, read_ready, write_ready;
+	struct {
+		_Atomic(int) head, tail, count;
+	} read_htc;
+
+
 	char read_buffer[SCHEDI_JOB_EPOLL_SOCKET_BUFFERSIZE];
-	_Atomic uint32_t read_count_condition;	// when count passes this,
+	uint32_t read_count_condition;	// when count passes this,
 						// the socket will be ready.
 						// It cannot be above
 						// SCHEDI_JOB_EPOLL_SOCKET_BUFFERSIZE
 						// If it is, then its undefined
 						// behaviour.
+	
+	struct {
+		_Atomic(int) head, tail, avail;	// avail:available space
+	} write_htc;
+
 	char write_buffer[SCHEDI_JOB_EPOLL_SOCKET_BUFFERSIZE];
-	_Atomic uint32_t write_buffer_condition; // when there is that amount of
+	uint32_t write_avail_condition; // when there is that amount of
 						 // space available to write, the
 						 // socket will be ready.
 
@@ -376,17 +382,6 @@ void schedi_ready_jobs_cache_reorganize_tick();
 int schedi_job_epoll_request_return(struct schedi_job_epoll_request *req, int error);
 
 /**
- * schedi_job_epoll_socket_return() - Called by the main epoll loop after an
- * event.
- * @sock: The socket registeration that triggered the event.
- * @error: Non-zero if epoll returned EPOLLERR or EPOLLHUP for this fd.
- * 
- * Return: 0 on success and if socket is still alive. -1 if socket or the owner is
- * dead. Caller epoll maintainer will clean up it from the epoll list.
- */
-int schedi_job_epoll_socket_return(struct schedi_job_epoll_socket* sock, int events);
-
-/**
  * schedi_job_tool_epoll() - Register an fd with epoll for this job.
  * @job: The job that wants to wait.
  * @socketfd: File descriptor to watch.
@@ -432,10 +427,44 @@ int schedi_job_epoll_socket_read(struct schedi_job_epoll_socket* socket,
 		char* data, size_t size);
 
 /**
+ * schedi_job_epoll_socket_write_return() - Flush the write buffer to the socket.
+ * @socket: The epoll socket whose write buffer is drained.
+ *
+ * Sends as much buffered data as the socket accepts, advancing the write tail
+ * by the amount sent.
+ *
+ * Return: Number of bytes sent on success. -1 if the socket is errored or shut
+ * down; the socket can be closed and removed from the epoll list.
+ */
+int schedi_job_epoll_socket_write_return(struct schedi_job_epoll_socket* socket);
+
+/**
+ * schedi_job_epoll_socket_read_return() - Receive into the read buffer from the socket.
+ * @socket: The epoll socket whose read buffer is filled.
+ *
+ * Receives as much data as the read buffer has space for, advancing the read
+ * head by the amount received. Returns 0 if the buffer is already full.
+ *
+ * Return: Number of bytes received on success. -1 if the socket is errored or
+ * shut down; the socket can be closed and removed from the epoll list.
+ */
+int schedi_job_epoll_socket_read_return(struct schedi_job_epoll_socket* socket);
+
+/**
  * schedi_job_epoll_socket_refresh() - Refreshes the readiness state.
  */
 int schedi_job_epoll_socket_refresh(struct schedi_job_epoll_socket* socket);
 
+/**
+ * schedi_job_epoll_socket_return() - Called by the main epoll loop after an
+ * event.
+ * @sock: The socket registeration that triggered the event.
+ * @error: Non-zero if epoll returned EPOLLERR or EPOLLHUP for this fd.
+ * 
+ * Return: 0 on success and if socket is still alive. -1 if socket or the owner is
+ * dead. Caller epoll maintainer will clean up it from the epoll list.
+ */
+int schedi_job_epoll_socket_return(struct schedi_job_epoll_socket* sock, int events);
 
 
 /**
