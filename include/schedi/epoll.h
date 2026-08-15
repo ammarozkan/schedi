@@ -46,7 +46,9 @@ int schedi_epoll_loop();
 /**
  * schedi_epoll_add - Register an fd with the main epoll (thread-safe).
  * @fd: File descriptor to watch.
- * @data: Tagged data handed back via epoll_event.data.ptr on event.
+ * @data: Tagged data handed back via epoll_event.data on event. A epoll_event
+ * data passed as this variable shall not be freed. From this call on, free of
+ * this data belongs to the epoll system no matter what the function returns.
  * @events: epoll events mask (EPOLLIN | EPOLLET | ...).
  *
  * Safe to call from any thread — epoll_ctl is thread-safe in the kernel.
@@ -54,5 +56,14 @@ int schedi_epoll_loop();
  * Return: 0 on success, -1 on error.
  */
 int schedi_epoll_add(int fd, struct schedi_epoll_data *data, uint32_t events);
+
+/**
+ * schedi_epoll_mod() - Epoll mod call.
+ * @fd: socket file descriptor.
+ * @events: events to update.
+ *
+ * Return: 0 on success, -1 on failure.
+ */
+int schedi_epoll_mod(int fd, struct schedi_epoll_data* data, uint32_t events);
 
 #endif /* SCHEDI_EPOLL_H */

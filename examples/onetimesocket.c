@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <stdatomic.h>
 #include <unistd.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -81,7 +82,8 @@ int job_func(struct schedi_job* job)
 {
 	struct job_context* context = (struct job_context*)job->context;
 
-	printf("Total Req:%u\t\tWaiting:%u\n", job->epoll_list->total_req, job->epoll_list->waiting_count);
+	printf("Total Req:%u\t\tWaiting:%u\n", job->epoll_list->total_req,
+		SCHEDI_JOB_METAFLAG_GETWAIT(atomic_load_explicit(&job->meta_flag, memory_order_relaxed)));
 	printf("Ret Count:%u\t\tError Count:%u\n", job->epoll_list->ret_count, job->epoll_list->err_count);
 
 	if(!context->server_created) {
@@ -156,7 +158,7 @@ int main()
 	}
 
 
-	schedi_epoll_loop();
+	schedi_epoll_loop(); // that would be on seperate thread.
 	for(unsigned int i = 0 ; i < JOB_COUNT ; i += 1) {
 		schedi_job_completion_wait(&indicator[i]);
 	}
@@ -164,4 +166,6 @@ int main()
 	printf("Completed.\n");
 
 	return 0;
+
+	//thread dinit is faulty but it would be here.
 }

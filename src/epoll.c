@@ -18,7 +18,25 @@ int schedi_epoll_add(int fd, struct schedi_epoll_data *data, uint32_t events)
 		.data = { .ptr = data },
 	};
 
-	return epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev);
+
+	int ret = epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev);
+
+	if (ret) {
+		free(data);
+	}
+
+	return ret;
+}
+
+int schedi_epoll_mod(int fd, struct schedi_epoll_data* data, uint32_t events)
+{
+	struct epoll_event ev = {
+		.events = events,
+		.data = { .ptr = data },
+	};
+	int ret = epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
+
+	return ret;
 }
 
 int schedi_epoll_loop()
@@ -70,8 +88,12 @@ int schedi_epoll_loop()
 				struct schedi_job_epoll_socket* sock = d->as.ptr;
 
 				if(schedi_job_epoll_socket_return(sock, evn)) {
-					epoll_ctl(epfd, EPOLL_CTL_DEL, sock->fd, NULL);
-					free(sock);
+					// capture the fd before releasing the epoll side's
+					// reference: done() may free the socket if this was
+					// the last one.
+					int fd = sock->fd;
+					schedi_job_tool_epollsocket_done(sock);
+					epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
 					free(d);
 				}
 				break;

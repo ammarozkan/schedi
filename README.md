@@ -136,11 +136,10 @@ int example_job_function (struct schedi_job* job)
 
 	return 0;	// returning 0 makes READYBASIC not marked. Returning 0 can be
                 // used to make job depend on something out of the system and
-                // triggering from outside of schedi. schedi_job_setready_controlled()
-                // should be called if that's the case after marking READYBASIC
-                // from outside. This function does the appropriate checks and
-                // sets job completely ready if everything else is OK. epoll tool
-                // etc. does the same call too.
+                // triggering from outside of schedi. To mark READYBASIC,
+                // schedi_job_mark_readybasic() should be called. Job will be
+                // ready to execute when the rest of the readinesses (such as 
+                // epoll requests, and epoll sockets) are also marked.
 }
 ```
 
@@ -203,6 +202,8 @@ this call can be made inside of job function.
 schedi_job_tool_epoll(job, fd, EPOLLIN);
 ```
 
+Note: file descriptor should be non-blocking.
+
 Then when the epoll loop gets triggered with ```EPOLLIN``` for the file descriptor
 ```fd```, job will be setted ready.
 
@@ -224,7 +225,7 @@ jobs. But as a side effect, performance can also be gained by seperating a job
 that has some independent parts from each other and could execute flawlessly as 
 seperated jobs with executing them asynchronously.
 
-Tests has ben made with Ryzen 5 2600 CPU.
+Tests has ben made with ```Intel Pentium N3710```.
 
 #### 100 Million Double Vector Randomization and Dot Product
 
@@ -239,56 +240,60 @@ them executed by schedi system.
 The same problem is solved with single-thread approach on 
 ```examples/aparalleljob_mono.c``` also to compare them.
 
-##### 2 threaded schedi with whole job parsed into 2 jobs
+#### 1 Threads 1 Jobs
 
-I did 4 tests with
+Job seperated to 1 thread and 1 jobs. So job is not seperated. schedi is
+just being used to call the function.
 
-```
-time ./bin/aparalleljob ; time ./bin/aparalleljob_mono
-```
+On 25 tests, 9.6% average increase on time with a standard deviation of 2.4.
 
-and on avarage of 45% (with 0.9 standard deviation) gain has been made
-on time with 2 thread 2 jobs.
+#### 2 Threads 2 Jobs
 
-##### same with 3 thread, 3 job
+Job seperated to 2 thread with 2 jobs. Job is seperated (as can be seen on
+the code) by whole 2 memory parts to not spend time with distanced positions
+on each thread.
 
-Interestingly the same 4 tests resulted with 38.8% increase on
-time (with 14.2 standard deviation). I think there's a collision
-of threads or something like that.
+On 25 tests, %44.6 average decrease on time with a standard deviation of 0.2.
 
-##### same with 4 thread, 4 job
+#### 3 Threads 3 Jobs
 
-55% increase on time (with 15.7 standard deviation).
+Tested CPU contains 2 cores. 3 threads won't have a logical increase. But it
+is important to see the schedi's impact on job scheduling calculation.
 
-#### same with 6 thread, 6 job
+On 25 tests, %60.9 average decrease on time with a standard deviation of 0.3.
 
-32% increase on time (with 9.9 standard deviation).
+#### Rest of The Tests
 
-#### same with 12 thread, 12 job
-
-15.5% increase on time (with 4.3 standard deviation).
-
-#### same with 24 thread, 24 job
-
-46% increase on time (with 14 standard deviation).
-
-Also there was a case with 145% increase on time but only occured
-once.
+- [4T 4J]: %69.5 average decrease, with stdev of 0.3
+- [7T 7J]: %63.5 average decrease, with stdev of 0.7
+- [10T 10J]: %66.2 average decrease, with stdev of 0.9
+- [16T 16J]: %66.9 average decrease, with stdev 1.4
+- [32T 32J]: %66.0 average decrease with stdev 1.5
+- [64T 64J]: %64.7 average decrease with stdev 1.0
+- [128T 128J]: %64.7 average decrease with stdev 1.0
 
 
 
 ### Flaws
 
-#### examples/aparalleljob
+#### epoll socket system is not tested yet
 
-When dividing the job more than 2 jobs and initializing same amount of threads,
-single-thread calculation is generally faster.
+epoll socket system provides a persistent epoll registeration with specifying
+required data amount for a socket to make a job ready is done but not tested
+yet and may contain faulty parts.
 
-#### one time epoll
+#### Job Ready Cache Being Full
 
-Currently epoll tool call only supports for one time check. Then the requested
-file descriptor is removed from epoll list. I am considering, and partially designed
-already, a continous socket system for that.
+There's an indication flag for that. And jobs dont get the "READY" flag unless
+they are cached but there's no way to get the non-cached jobs and regularly
+try them to being cached. I sensed that its meaningless as that thing
+will be filled up too (unless it's a dynamic list!). Practically workers
+should stop working for this to happen. And, do not do that. Why stopping
+the workers? Workers should work. It's their job.
+
+If theres a problem but couldnt being figured out, think about checking if
+job cache is full or not. If it is, try triggering jobs to be cached by
+touching them after a time.
 
 #### shutdown race
 

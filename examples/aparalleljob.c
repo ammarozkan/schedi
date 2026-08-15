@@ -72,7 +72,7 @@ int main()
 	start_end[0][1] = (int)VECTOR_COUNT / PARALLEL_JOB_COUNT;
 	for(unsigned int i = 1 ; i < PARALLEL_JOB_COUNT-1 ; i += 1) {
 		start_end[i][0] = start_end[i-1][1];
-		start_end[i][1] = start_end[0][0]*(i+1);
+		start_end[i][1] = start_end[0][1]*(i+1);
 	}
 
 	start_end[PARALLEL_JOB_COUNT-1][0] = start_end[PARALLEL_JOB_COUNT-2][1];
@@ -111,7 +111,7 @@ int main()
 		//printf("Job %u wait done.\n",i);
 	}
 
-	return 0;
+	return 0; // deinit is faulty on lockly system.
 	if(schedi_worker_deinit()) {
 		LogPrint();
 		printf("Worker Deinit Failed\n");

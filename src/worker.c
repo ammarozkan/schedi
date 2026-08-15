@@ -50,23 +50,26 @@ static void *worker_routine(void *arg)
 			// time interval. Even 30 seconds does not guarantee that.
 			// (a bit extremism here)
 
-			//schedi_waitforjob(); 	// also unlock readyjob_lock
-									// I thought that maybe I could
-									// check shutdown and go to picking
-									// without an unlock. But maybe 
-									// giving a space to other waiters
-									// more efficient.
-									// When the codebase comes to a
-									// state that those optimizations could
-									// be tested, change and test them.
-									// I will call this ISSUE_SHUTDOWN_CHECK_ON_LOCK_WORKER
-									// Is doing appropriate things
-									// then picking a job without leaving 
-									// the lock, or leaving the lock and 
-									// going back from all over more efficient?
-									// Actually it seems like obvious that
-									// holding the lock while doing all
-									// the checks a bit stupid.
+#ifndef LOCKLESS_READYJOB
+			schedi_waitforjob(); 	// also unlock readyjob_lock
+#endif /*LOCKLESS_READYJOB*/
+						
+						// I thought that maybe I could
+						// check shutdown and go to picking
+						// without an unlock. But maybe 
+						// giving a space to other waiters
+						// more efficient.
+						// When the codebase comes to a
+						// state that those optimizations could
+						// be tested, change and test them.
+						// I will call this ISSUE_SHUTDOWN_CHECK_ON_LOCK_WORKER
+						// Is doing appropriate things
+						// then picking a job without leaving 
+						// the lock, or leaving the lock and 
+						// going back from all over more efficient?
+						// Actually it seems like obvious that
+						// holding the lock while doing all
+						// the checks a bit stupid.
 			goto _continue;
 		} else {
 			schedi_flog("worker_routine schedi_pickedreadyjob()",0);
@@ -81,8 +84,9 @@ _got_a_job:
 									// check can be removed.
 		schedi_job_unmark_access(job);	// holding the access from pickready.
 		int ret = job->run(job);
-		schedi_job_unmark_executing(job); 	// as we success marking execute,
-											// we will success on unmarking.
+		job->state = schedi_job_state_suspended;
+		schedi_job_unmark_executing(job); 	// as with success marking execute,
+							// it will success on unmarking.
 		if(ret < 0) {
 			schedi_flog("schedi_job_fn returned <0. Indicating completion.", 0);
 			schedi_job_completion_indicate(job);
@@ -91,9 +95,6 @@ _got_a_job:
 			schedi_flog("schedi_job_destroy called. (code:schedi_job_destroy(job))",ret);
 		} else if(ret == 1) { 
 			schedi_job_mark_readybasic(job);
-			schedi_job_setready_controlled(job);
-		} else {
-			job->state = schedi_job_state_suspended;
 		}
 
 _continue:

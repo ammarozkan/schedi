@@ -66,6 +66,18 @@ struct HTC {
 )
 
 
+static void dq_dec_count()
+{
+	long long htc = atomic_load_explicit(&dq.htc, memory_order_relaxed);
+	long long desired;
+	struct HTC _htc, _des;
+	do {
+		uint16_t count = HTC_COUNT(htc);
+		count -= 1;
+		desired = (htc&~((long long)0xFFFF<<16)) | (count<<16);
+	} while(!atomic_compare_exchange_strong(&dq.htc, &htc, desired));
+}
+
 // returns -1 if queue is full
 // returns 0 in success
 
@@ -125,6 +137,8 @@ static struct schedi_job* name()						\
 		_htc.head = HTC_HEAD(htc);					\
 		_htc.label = HTC_LABEL(htc);					\
 										\
+		if (_htc.tail == _htc.head) return NULL; /* oversell control */	\
+		/* for super_pop use */						\
 		_des = _htc;							\
 		_des.tail = (_htc.tail + 1) % SCHEDI_DQ_SIZE;			\
 		super;								\
@@ -148,6 +162,7 @@ DEFINE_DQ_PUSH_ATOMIC(dq_super_push_atomic, (void)0);
 
 DEFINE_DQ_POP_ATOMIC(dq_pop_atomic, _des.count -= 1);
 DEFINE_DQ_POP_ATOMIC(dq_super_pop_atomic, (void)0);
+
 
 
 // super pop and push does not do anything to the count
@@ -248,7 +263,7 @@ static void section_release(size_t idx)
 			pthread_mutex_unlock(&job_array.section_lock);
 			return;
 		}
-		job_array.flags |= 1;
+		job_array.flags |= SCHEDI_JOB_ARRAY_SECTION_WARN;
 	}
 	pthread_mutex_unlock(&job_array.section_lock);
 }
@@ -314,7 +329,9 @@ int schedi_wake_job_waiter()
 {
 	int ret = 0;
 	schedi_flog("on schedi_wake_job_waiter() pthread_mutex_lock(&readyjob_mutex)",ret);
+	pthread_mutex_lock(&readyjob_mutex);
 	ret |= pthread_cond_signal(&readyjob_cond);
+	pthread_mutex_unlock(&readyjob_mutex);
 	return ret;
 }
 #else
@@ -425,6 +442,8 @@ struct schedi_job* schedi_cache_job_ready_pop()
 			if(atomic_compare_exchange_strong_explicit( &job_array.ready_jobs_cache[i],
 					&checked_cache, NULL, memory_order_release, memory_order_relaxed)) {
 				schedi_ready_jobs_cache_sub_job_count();
+				atomic_fetch_and_explicit(&job_array.flags, ~SCHEDI_JOB_ARRAY_FULL,
+						memory_order_relaxed);
 				return checked_cache; // cache == checked_cache. Success.
 			} else {
 			schedi_flog("checked_cache check (code:checked_cache>0)", checked_cache>0);
@@ -437,7 +456,7 @@ struct schedi_job* schedi_cache_job_ready_pop()
 }
 
 // checks the jobs one by one. maybe optimization for that?
-void schedi_cache_job_ready(struct schedi_job* job)
+int schedi_cache_job_ready(struct schedi_job* job)
 {
 	for(unsigned int i = 0 ; i < SCHEDI_MAXIMUM_JOBS ; i += 1) {
 		struct schedi_job* checked_cache = atomic_load_explicit(&job_array.ready_jobs_cache[i], memory_order_acquire);
@@ -446,10 +465,14 @@ void schedi_cache_job_ready(struct schedi_job* job)
 			if (atomic_compare_exchange_strong_explicit(&job_array.ready_jobs_cache[i], 
 				&checked_cache, job, memory_order_release, memory_order_relaxed)) {
 				schedi_ready_jobs_cache_add_job_count();
-				return; // its a success. lets go away.
+				return 0; // its a success. lets go away.
 			}
 		} while(1);
 	}
+
+	atomic_fetch_or_explicit(&job_array.flags, SCHEDI_JOB_ARRAY_FULL,
+			memory_order_relaxed);
+	return -1;
 }
 
 static struct schedi_job* schedi_ready_jobs_cache_pop_specific(unsigned int indice)
@@ -472,7 +495,7 @@ void schedi_ready_jobs_cache_reorganize()
 
 	uint32_t peaked_job_count = (job_array.job_count >> 32) & 0xFFFFFFFF;
 	uint32_t reorganized_jobs = 0;
-	for(unsigned int i = peaked_job_count ; i <= SCHEDI_MAXIMUM_JOBS ; i -= 1) {
+	for(int i = peaked_job_count-1 ; i >= 0 ; i -= 1) {
 		struct schedi_job* job = schedi_ready_jobs_cache_pop_specific(i);
 		if (job == NULL) continue;
 		schedi_cache_job_ready(job); // popping a job and caching it closer
@@ -525,7 +548,7 @@ unsigned int schedi_job_mark_or(struct schedi_job* job, unsigned int flag, unsig
 	while( !(ban = (meta_flag & banned_flags) | ((-(int)ban_access) & (meta_flag & SCHEDI_JOB_METAFLAG_ACCESS))) ) {
 		desired = meta_flag | flag;
 
-		if(!atomic_compare_exchange_strong_explicit(&(job->meta_flag), &meta_flag, desired, 
+		if(atomic_compare_exchange_strong_explicit(&(job->meta_flag), &meta_flag, desired, 
 					memory_order_release, memory_order_relaxed))
 			return 0;
 	}
@@ -547,13 +570,87 @@ unsigned int schedi_job_unmark_or(struct schedi_job* job, unsigned int flag, uns
 		&& meta_flag & flag) {
 		desired = meta_flag & (~flag);
 
-		if(!atomic_compare_exchange_strong_explicit(&(job->meta_flag), &meta_flag, desired, 
+		if(atomic_compare_exchange_strong_explicit(&(job->meta_flag), &meta_flag, desired, 
 					memory_order_release, memory_order_relaxed))
 			return 0;
 	}
 
 	return ban;
 }
+
+
+static bool schedi_job_meta_flag_check_allready(unsigned int meta_flag)
+{
+	unsigned int req = SCHEDI_JOB_METAFLAG_READYBASIC |
+		SCHEDI_JOB_METAFLAG_READYEPOLLTOOL |
+		SCHEDI_JOB_METAFLAG_READYEPOLLSOCK;
+	return (meta_flag & req) == req;
+}
+
+// CAS-updates job->meta_flag. Applies @sock_delta to the packed
+// available_sockets and @wait_delta to the packed waiting_count, or-sets
+// @flag, recomputes the derived READYEPOLLSOCK/READYEPOLLTOOL bits from the
+// resulting counts, and triggers schedi_job_setready() when the update
+// completes the full readiness set (old readiness false, new readiness true).
+//
+// Fails returning a positive value (the banned flags) when @banned_flags are
+// set, or when @ban_access is set while the access count is non-zero. Fails
+// returning -1 when a packed count would leave the 4-bit range 0..15.
+//
+// Return: 0 on success, positive banned flags on ban, -1 on count out of
+// range.
+static int schedi_job_meta_flag_cas_update(struct schedi_job* job,
+		int sock_delta, int wait_delta, unsigned int flag,
+		unsigned int banned_flags, bool ban_access)
+{
+	uint32_t meta_flag = atomic_load_explicit(&(job->meta_flag), memory_order_acquire);
+	uint32_t desired;
+	int required = job->required_available_sockets;
+
+	unsigned int ban;
+
+	bool pre_ready, ready;
+
+	while( !(ban = (meta_flag & banned_flags) | ((-(int)ban_access) & (meta_flag & SCHEDI_JOB_METAFLAG_ACCESS))) ) {
+		int avail = SCHEDI_JOB_METAFLAG_GETAVAIL(meta_flag) + sock_delta;
+		int waiting = SCHEDI_JOB_METAFLAG_GETWAIT(meta_flag) + wait_delta;
+
+		if(avail < 0 || avail > 15 || waiting < 0 || waiting > 15)
+			return -1;
+
+		desired = meta_flag;
+		SCHEDI_JOB_METAFLAG_SETAVAIL(desired, avail);
+		SCHEDI_JOB_METAFLAG_SETWAIT(desired, waiting);
+		desired |= flag;
+		desired &= ~(SCHEDI_JOB_METAFLAG_READYEPOLLSOCK | SCHEDI_JOB_METAFLAG_READYEPOLLTOOL);
+		if(avail >= required)
+			desired |= SCHEDI_JOB_METAFLAG_READYEPOLLSOCK;
+		if(waiting == 0)
+			desired |= SCHEDI_JOB_METAFLAG_READYEPOLLTOOL;
+
+		pre_ready = schedi_job_meta_flag_check_allready(meta_flag);
+		ready = schedi_job_meta_flag_check_allready(desired);
+
+		if(atomic_compare_exchange_strong_explicit(&(job->meta_flag), &meta_flag, desired, 
+					memory_order_release, memory_order_relaxed)) {
+			if(!pre_ready && ready) {
+				schedi_job_setready(job);
+			}
+			return 0;
+		}
+	}
+
+	return ban;
+}
+
+unsigned int schedi_job_mark_or_readiness(struct schedi_job* job, 
+		unsigned int flag, unsigned int banned_flags, bool ban_access)
+{
+	int ret = schedi_job_meta_flag_cas_update(job, 0, 0, flag,
+			banned_flags, ban_access);
+	return ret > 0 ? (unsigned int)ret : 0;
+}
+
 
 unsigned int schedi_job_mark_or_default(struct schedi_job* job, unsigned int flag)
 {
@@ -618,7 +715,7 @@ unsigned int schedi_job_mark_access(struct schedi_job* job)
 		accesses += 1;
 		SCHEDI_JOB_METAFLAG_SETACCESS(desired, accesses);
 
-		if(!atomic_compare_exchange_strong(&(job->meta_flag), &meta_flag, desired))
+		if(atomic_compare_exchange_strong(&(job->meta_flag), &meta_flag, desired))
 			return 0;
 	}
 
@@ -639,7 +736,7 @@ unsigned int schedi_job_unmark_access(struct schedi_job* job)
 		accesses -= 1;
 		SCHEDI_JOB_METAFLAG_SETACCESS(desired, accesses);
 
-		if(!atomic_compare_exchange_strong(&(job->meta_flag), &meta_flag, desired))
+		if(atomic_compare_exchange_strong(&(job->meta_flag), &meta_flag, desired))
 			return 0;
 	}
 
@@ -663,7 +760,7 @@ unsigned int schedi_job_unmark_ready(struct schedi_job* job)
 
 unsigned int schedi_job_mark_readybasic(struct schedi_job* job)
 {
-	return schedi_job_mark_or(job, SCHEDI_JOB_METAFLAG_READYBASIC, 
+	return schedi_job_mark_or_readiness(job, SCHEDI_JOB_METAFLAG_READYBASIC, 
 		SCHEDI_JOB_METAFLAG_UNSTABLE | 
 		SCHEDI_JOB_METAFLAG_WLLDESTROY, false);
 }
@@ -676,20 +773,10 @@ unsigned int schedi_job_unmark_readybasic(struct schedi_job* job)
 }
 
 
-unsigned int schedi_job_mark_readyepollsock(struct schedi_job* job)
-{
-	return schedi_job_mark_or(job, SCHEDI_JOB_METAFLAG_READYEPOLLSOCK, 
-		SCHEDI_JOB_METAFLAG_UNSTABLE | 
-		SCHEDI_JOB_METAFLAG_WLLDESTROY, false);
-}
-
-unsigned int schedi_job_unmark_readyepollsock(struct schedi_job* job)
-{
-	return schedi_job_unmark_or(job, SCHEDI_JOB_METAFLAG_READYEPOLLSOCK, 
-		SCHEDI_JOB_METAFLAG_UNSTABLE | 
-		SCHEDI_JOB_METAFLAG_WLLDESTROY, false);
-}
-
+// the derived READYEPOLLTOOL and READYEPOLLSOCK bits are not marked directly
+// anymore: they are recomputed from the packed available_sockets and
+// waiting_count fields on every meta_flag CAS update (see
+// schedi_job_meta_flag_cas_update()).
 
 // tries destroying now. if nothing else playing with the data, will succesfully
 // destroy it.
@@ -735,6 +822,8 @@ void schedi_job_destroy_queue_check(void)
 		if (job == NULL) break;
 		if (!schedi_job_destroy_now(job)) {
 			dq_super_push(job);
+		} else {
+			dq_dec_count();
 		}
 	} while(1);
 }
@@ -774,16 +863,14 @@ int schedi_job_epoll_request_return(struct schedi_job_epoll_request *req, int er
 
 	struct schedi_job_epoll_requests_list *list = req->list;
 
-	unsigned int prev_waiting = atomic_fetch_sub_explicit(&list->waiting_count, 1, memory_order_acq_rel);
-
 	if (error)
 		atomic_fetch_add_explicit(&list->err_count, 1, memory_order_relaxed);
 	else
 		atomic_fetch_add_explicit(&list->ret_count, 1, memory_order_relaxed);
 
-	if (prev_waiting == 1) {
-		schedi_job_setready_controlled(owner);
-	}
+	// the decrement recomputes the derived READYEPOLLTOOL bit and triggers
+	// schedi_job_setready() when it completes the readiness set.
+	schedi_job_meta_flag_cas_update(owner, 0, -1, 0, 0, false);
 
 	schedi_job_unmark_access(owner);
 
@@ -804,11 +891,17 @@ int schedi_job_tool_epoll(struct schedi_job *job, int socketfd, uint32_t events)
 
 	struct schedi_job_epoll_requests_list *list = req->list;
 	atomic_fetch_add_explicit(&list->total_req, 1, memory_order_relaxed);
-	atomic_fetch_add_explicit(&list->waiting_count, 1, memory_order_acq_rel);
+
+	// the packed waiting_count field is 4 bits: at most 15 requests can be
+	// outstanding for a job. fail rather than let the count wrap.
+	if(schedi_job_meta_flag_cas_update(job, 0, 1, 0, 0, false) != 0) {
+		free(req);
+		return -4;
+	}
 
 	struct schedi_epoll_data *data = malloc(sizeof(*data));
 	if (!data) {
-		atomic_fetch_sub_explicit(&list->waiting_count, 1, memory_order_acq_rel);
+		schedi_job_meta_flag_cas_update(job, 0, -1, 0, 0, false);
 		free(req);
 		return -2;
 	}
@@ -817,8 +910,7 @@ int schedi_job_tool_epoll(struct schedi_job *job, int socketfd, uint32_t events)
 	data->as.ptr = req;
 
 	if (schedi_epoll_add(socketfd, data, events) < 0) {
-		atomic_fetch_sub_explicit(&list->waiting_count, 1, memory_order_acq_rel);
-		free(data);
+		schedi_job_meta_flag_cas_update(job, 0, -1, 0, 0, false);
 		free(req);
 		return -3;
 	}
@@ -833,7 +925,6 @@ struct schedi_job_epoll_requests_list *schedi_job_epoll_requests_list_new(void)
 		return NULL;
 
 	list->total_req = 0;
-	list->waiting_count = 0;
 	list->ret_count = 0;
 	list->err_count = 0;
 	return list;
@@ -844,75 +935,278 @@ void schedi_job_epoll_requests_list_destroy(struct schedi_job_epoll_requests_lis
 	free(list);
 }
 
-static void schedi_job_epoll_socket_update_read_ready(
-		struct schedi_job_epoll_socket* _socket, uint32_t count)
+static int schedi_job_epoll_socket_count_from(uint64_t htc)
 {
-	uint32_t condition = _socket->read_count_condition;
-	bool read_ready = count >= condition;
-	atomic_store_explicit(&_socket->read_ready, read_ready, memory_order_release);
-
-	bool write_ready = atomic_load_explicit(&_socket->write_ready,
-			memory_order_acquire);
-	atomic_store_explicit(&_socket->ready, read_ready && write_ready,
-			memory_order_release);
+	return (int)(htc & SCHEDI_JOB_EPOLL_SOCKET_COUNT_MASK);
 }
 
-static void schedi_job_epoll_socket_update_write_ready(
-		struct schedi_job_epoll_socket* _socket, uint32_t avail)
+static int schedi_job_epoll_socket_avail_from(uint64_t htc)
 {
-	uint32_t condition = _socket->write_avail_condition;
-	bool write_ready = avail >= condition;
-	atomic_store_explicit(&_socket->write_ready, write_ready, memory_order_release);
+	return (int)((htc & SCHEDI_JOB_EPOLL_SOCKET_AVAIL_MASK)
+			>> SCHEDI_JOB_EPOLL_SOCKET_AVAIL_SHIFT);
+}
 
-	bool read_ready = atomic_load_explicit(&_socket->read_ready,
+// Updates ready socket count on jobs atomically by the atomic change of
+// readiness of sockets. For this to work, readiness exchange on sockets
+// should be executed with a CAS loop.
+static void schedi_job_epoll_socket_jobready_update(
+		struct schedi_job_epoll_socket* _socket,
+		uint64_t old_htc, uint64_t new_htc)
+{
+	bool old_ready = old_htc & SCHEDI_JOB_EPOLL_SOCKET_READY;
+	bool new_ready = new_htc & SCHEDI_JOB_EPOLL_SOCKET_READY;
+
+	if(old_ready == new_ready)
+		return;
+
+	if(!schedi_job_epollsocket_accessjob(_socket)) return;
+
+	struct schedi_job* job = _socket->job;
+
+	// apply the ready-socket delta to the packed available_sockets. the CAS
+	// recomputes the derived READYEPOLLSOCK bit from the resulting count and
+	// triggers schedi_job_setready() when it completes the readiness set.
+	schedi_job_meta_flag_cas_update(job, new_ready ? 1 : -1, 0, 0, 0, false);
+
+	schedi_job_unmark_access(job);
+}
+
+// applies a delta to avail and recomputes write_ready and the complete
+// readiness in a single CAS on the packed htc.
+static void schedi_job_epoll_socket_avail_add(
+		struct schedi_job_epoll_socket* _socket, int delta, bool dead)
+{
+	uint64_t htc = atomic_load_explicit(&_socket->htc, memory_order_acquire);
+	uint64_t des_htc;
+	do {
+		int des_avail = schedi_job_epoll_socket_avail_from(htc) + delta;
+		bool write_ready = (uint32_t)des_avail >= _socket->write_avail_condition;
+		bool read_ready = htc & SCHEDI_JOB_EPOLL_SOCKET_READ_READY;
+		bool is_dead = dead || (htc & SCHEDI_JOB_EPOLL_SOCKET_DEAD);
+		bool ready = read_ready && write_ready || is_dead;
+
+		des_htc = (htc & ~(SCHEDI_JOB_EPOLL_SOCKET_AVAIL_MASK
+					| SCHEDI_JOB_EPOLL_SOCKET_WRITE_READY
+					| SCHEDI_JOB_EPOLL_SOCKET_READY))
+			| ((uint64_t)des_avail << SCHEDI_JOB_EPOLL_SOCKET_AVAIL_SHIFT)
+			| (write_ready ? SCHEDI_JOB_EPOLL_SOCKET_WRITE_READY : 0)
+			| (ready ? SCHEDI_JOB_EPOLL_SOCKET_READY : 0)
+			| (is_dead ? SCHEDI_JOB_EPOLL_SOCKET_DEAD : 0);
+	} while(!atomic_compare_exchange_strong_explicit(&_socket->htc,
+				&htc, des_htc,
+				memory_order_release, memory_order_relaxed));
+
+	schedi_job_epoll_socket_jobready_update(_socket, htc, des_htc);
+}
+
+// when socket dies, socket needs to be marked as ready. as avail and count
+// add functions are doing that, in cases that those functions are not called,
+// that socket_dead function updates socket as ready, doing the appropriate
+// same update (schedi_job_epoll_socket_jobready_update())
+static void schedi_job_epoll_socket_dead(
+		struct schedi_job_epoll_socket* _socket)
+{
+	uint64_t htc = atomic_load_explicit(&_socket->htc, memory_order_acquire);
+	uint64_t des_htc;
+	do {
+		des_htc = htc | SCHEDI_JOB_EPOLL_SOCKET_DEAD
+			| SCHEDI_JOB_EPOLL_SOCKET_READY;
+	} while(!atomic_compare_exchange_strong_explicit(&_socket->htc,
+				&htc, des_htc,
+				memory_order_release, memory_order_relaxed));
+
+	schedi_job_epoll_socket_jobready_update(_socket, htc, des_htc);
+}
+
+// applies a delta to count and recomputes read_ready and the complete
+// readiness in a single CAS on the packed htc.
+static void schedi_job_epoll_socket_count_add(
+		struct schedi_job_epoll_socket* _socket, int delta, bool dead)
+{
+	uint64_t htc = atomic_load_explicit(&_socket->htc, memory_order_acquire);
+	uint64_t des_htc;
+	do {
+		int des_count = schedi_job_epoll_socket_count_from(htc) + delta;
+		bool read_ready = (uint32_t)des_count >= _socket->read_count_condition;
+		bool write_ready = htc & SCHEDI_JOB_EPOLL_SOCKET_WRITE_READY;
+		bool is_dead = dead || (htc & SCHEDI_JOB_EPOLL_SOCKET_DEAD);
+		bool ready = read_ready && write_ready || is_dead;
+
+		des_htc = (htc & ~(SCHEDI_JOB_EPOLL_SOCKET_COUNT_MASK
+					| SCHEDI_JOB_EPOLL_SOCKET_READ_READY
+					| SCHEDI_JOB_EPOLL_SOCKET_READY))
+			| ((uint64_t)des_count & SCHEDI_JOB_EPOLL_SOCKET_COUNT_MASK)
+			| (read_ready ? SCHEDI_JOB_EPOLL_SOCKET_READ_READY : 0)
+			| (ready ? SCHEDI_JOB_EPOLL_SOCKET_READY : 0)
+			| (is_dead ? SCHEDI_JOB_EPOLL_SOCKET_DEAD : 0);
+	} while(!atomic_compare_exchange_strong_explicit(&_socket->htc,
+				&htc, des_htc,
+				memory_order_release, memory_order_relaxed));
+
+	schedi_job_epoll_socket_jobready_update(_socket, htc, des_htc);
+}
+
+
+
+
+
+
+struct schedi_job_epoll_socket*
+schedi_job_tool_epollsocket(struct schedi_job* job, int socketfd)
+{
+	struct schedi_job_epoll_socket* sock;
+	sock = (typeof(sock))malloc(sizeof(*sock));
+
+	sock->job = job;
+	sock->gen = job->gen;
+
+	sock->fd = socketfd;
+	// count = 0, avail = BUFFERSIZE, all readiness bits clear
+	uint64_t htc = (uint64_t)SCHEDI_JOB_EPOLL_SOCKET_BUFFERSIZE
+		<< SCHEDI_JOB_EPOLL_SOCKET_AVAIL_SHIFT;
+
+	//atomic_store_explicit(&sock->htc, htc, memory_order_release);
+	sock->htc = htc;
+
+	sock->read_htc.head = 0;
+	sock->read_htc.tail = 0;
+
+	sock->read_count_condition = 1;
+
+	sock->write_htc.head = 0;
+	sock->write_htc.tail = 0;
+
+	sock->write_avail_condition = 1;
+
+	sock->fall = 2;
+
+	// if the initial state already satisfies both readiness conditions the
+	// socket starts counting toward the job's available_sockets.
+	bool read_ready = (uint32_t)schedi_job_epoll_socket_count_from(htc)
+		>= sock->read_count_condition;
+	bool write_ready = (uint32_t)schedi_job_epoll_socket_avail_from(htc)
+		>= sock->write_avail_condition;
+	bool ready = read_ready && write_ready;
+
+	uint64_t des_htc = htc
+		| (read_ready ? SCHEDI_JOB_EPOLL_SOCKET_READ_READY : 0)
+		| (write_ready ? SCHEDI_JOB_EPOLL_SOCKET_WRITE_READY : 0)
+		| (ready ? SCHEDI_JOB_EPOLL_SOCKET_READY : 0);
+	atomic_store_explicit(&sock->htc, des_htc, memory_order_release);
+
+	if(ready) {
+		schedi_job_meta_flag_cas_update(job, 1, 0, 0, 0, false);
+	}
+
+	struct schedi_epoll_data* data;
+	data = (typeof(data))malloc(sizeof(*data));
+	data->type = SCHEDI_EPOLL_DATA_SOCKET;
+	data->as.ptr = (void*)sock;
+	sock->data_ptr = data;
+	if (schedi_epoll_add(socketfd, data,
+				EPOLLIN|EPOLLOUT|
+				EPOLLONESHOT)) {
+		if(ready)
+			schedi_job_meta_flag_cas_update(job, -1, 0, 0, 0, false);
+		free(sock);
+		return NULL;
+	}
+
+
+	return sock;
+}
+
+static int schedi_job_epoll_socket_write_buffer_data(
+		struct schedi_job_epoll_socket* _socket, const char* data,
+		size_t size)
+{
+	uint64_t htc = atomic_load_explicit(&_socket->htc, memory_order_acquire);
+	int avail = schedi_job_epoll_socket_avail_from(htc);
+
+	int head = atomic_load_explicit(&_socket->write_htc.head,
 			memory_order_acquire);
-	atomic_store_explicit(&_socket->ready, read_ready && write_ready,
-			memory_order_release);
+
+	int new_head = head;
+
+	size_t total = 0;
+	size_t write_size = min(size, avail);
+
+	size_t first_write = min(write_size,
+			SCHEDI_JOB_EPOLL_SOCKET_BUFFERSIZE - head);
+	memcpy(_socket->write_buffer + head, data, first_write);
+	total += first_write;
+
+	if(head+write_size >= SCHEDI_JOB_EPOLL_SOCKET_BUFFERSIZE) {
+		size_t rest_write = write_size-first_write;
+		memcpy(_socket->write_buffer, data+first_write, rest_write);
+		total += rest_write;
+		new_head = rest_write;
+	} else {
+		new_head += total;
+	}
+
+	atomic_store_explicit(&_socket->write_htc.head, 
+			new_head, memory_order_release);
+
+
+	// here, if the dead flag is stalely false but socket is really dead,
+	// it could be marked as not-ready while it really is ready. This could
+	// happen
+	schedi_job_epoll_socket_avail_add(_socket, -(int)total, false);
+
+	return (int)total;
 }
 
 int schedi_job_epoll_socket_write(struct schedi_job_epoll_socket* _socket,
 		char* data, size_t size)
 {
-	int avail = atomic_load_explicit(&_socket->write_htc.avail, 
-			memory_order_acquire);
-	int head = atomic_load_explicit(&_socket->write_htc.head,
-			memory_order_acquire);
-	
-	size_t avail_size = avail;
-	size_t write_size = min(size, avail_size);
+	uint64_t htc = atomic_load_explicit(&_socket->htc, memory_order_acquire);
+	size_t total = 0;
 
-	if(write_size + head >= SCHEDI_JOB_EPOLL_SOCKET_BUFFERSIZE) {
-		size_t fwrite = SCHEDI_JOB_EPOLL_SOCKET_BUFFERSIZE - head;
-		size_t rest_write = write_size - fwrite;
-		
-		memcpy(_socket->write_buffer + head, data, fwrite);
-		memcpy(_socket->write_buffer, data + fwrite, rest_write);
-		head = rest_write;
-	} else {
-		memcpy(_socket->write_buffer + head, data, write_size);
-		head = head + write_size;
+	// if the write buffer is empty, write directly to the socket and send
+	// as much as it can take right now.
+	if(schedi_job_epoll_socket_avail_from(htc) == SCHEDI_JOB_EPOLL_SOCKET_BUFFERSIZE) {
+		ssize_t sent = send(_socket->fd, data, size, MSG_NOSIGNAL);
+		if(sent > 0) {
+			total = (size_t)sent;
+			data += (size_t)sent;
+			size -= (size_t)sent;
+		} else if(sent < 0 && (errno != EAGAIN && errno != EWOULDBLOCK)) {
+			// hard error: the socket is dead.
+			schedi_job_epoll_socket_dead(_socket);
+			return -1;
+		}
 	}
 
-	size_t des_avail;
-	do {
-		des_avail = avail - write_size;
-	} while(!atomic_compare_exchange_strong_explicit(
-				&_socket->write_htc.avail, 
-				&avail, des_avail,
-				memory_order_release, memory_order_relaxed));
+	// assuming there was no data on buffer here, there are some data that 
+	// are not and couldnt wroten. that means socket was ready, while buffer
+	// was empty. that means epoll shouldve woked this socket up. 
+	// (let me name this case#sww11). If socket didnt woke up, it will.
+	
+	// rest of it will be written to buffer.
+	if(size > 0) {
+		// writes to buffer with no condition.
+		int ret = schedi_job_epoll_socket_write_buffer_data(_socket, data, size);
 
-	atomic_store(&_socket->write_htc.head, head);
-
-	schedi_job_epoll_socket_update_write_ready(_socket, des_avail);
-
-	return write_size;
+		total += ret;
+		// epoll_ctl_mod here to wakey wakey. (by case#sww11, socket should be
+		// inactive on the epoll list OR epoll WILL wake it up anyway. So
+		// for both cases, using mod and making epoll be aware of that socket
+		// is substantial.)
+		//
+		// In other words, moding a socket guarantees a next 
+		// epoll_wait() returns the socket if its ready.
+		schedi_epoll_mod(_socket->fd, _socket->data_ptr,
+				EPOLLIN|EPOLLOUT|EPOLLONESHOT);
+	}
+	return (int)total;
 }
 
 int schedi_job_epoll_socket_read(struct schedi_job_epoll_socket* _socket,
 		char* data, size_t size)
 {
-	int count = atomic_load_explicit(&_socket->read_htc.count,
-			memory_order_acquire);
+	uint64_t htc = atomic_load_explicit(&_socket->htc, memory_order_acquire);
+	int count = schedi_job_epoll_socket_count_from(htc);
 	int tail = atomic_load_explicit(&_socket->read_htc.tail,
 			memory_order_acquire);
 
@@ -923,35 +1217,42 @@ int schedi_job_epoll_socket_read(struct schedi_job_epoll_socket* _socket,
 		size_t fread = SCHEDI_JOB_EPOLL_SOCKET_BUFFERSIZE - tail;
 		size_t rest_read = read_size - fread;
 
-		memcpy(_socket->read_buffer + tail, data, fread);
-		memcpy(_socket->read_buffer, data + fread, rest_read);
+		memcpy(data, _socket->read_buffer + tail, fread);
+		memcpy(data + fread, _socket->read_buffer, rest_read);
 		tail = rest_read;
 	} else {
-		memcpy(_socket->read_buffer + tail, data, read_size);
+		memcpy(data, _socket->read_buffer + tail, read_size);
 		tail += read_size;
 	}
 
-	size_t des_count;
-	do {
-		des_count = count - read_size;
-	} while(!atomic_compare_exchange_strong_explicit(&_socket->read_htc.count,
-				&count, des_count,
-				memory_order_release, memory_order_relaxed));
+	schedi_job_epoll_socket_count_add(_socket, -(int)read_size, false);
 
 	atomic_store(&_socket->read_htc.tail, tail);
 
-	schedi_job_epoll_socket_update_read_ready(_socket, des_count);
+	if(count == SCHEDI_JOB_EPOLL_SOCKET_BUFFERSIZE) {
+		// buffer was full and socket read return probably couldnt fill
+		// new data to buffer. lets activate socket and let it try 
+		// read_return again.
+		schedi_epoll_mod(_socket->fd, _socket->data_ptr, 
+				EPOLLIN|EPOLLOUT|EPOLLONESHOT);
+	}
 
 	return read_size;
 }
 
 int schedi_job_epoll_socket_write_return(struct schedi_job_epoll_socket* _socket)
 {
-	int tail = atomic_load_explicit(&_socket->write_htc.tail,
-			memory_order_acquire);
-	int avail = atomic_load_explicit(&_socket->write_htc.avail,
-			memory_order_acquire);
+	int tail;
+	uint64_t htc;
+	int avail;
 
+	tail = atomic_load_explicit(&_socket->write_htc.tail,
+			memory_order_acquire);
+	
+	htc = atomic_load_explicit(&_socket->htc, memory_order_acquire);
+	avail = schedi_job_epoll_socket_avail_from(htc);
+
+avail_changed:
 	size_t sendable = SCHEDI_JOB_EPOLL_SOCKET_BUFFERSIZE - avail;
 	size_t total = 0;
 
@@ -962,11 +1263,22 @@ int schedi_job_epoll_socket_write_return(struct schedi_job_epoll_socket* _socket
 
 	ssize_t sent = send(_socket->fd, _socket->write_buffer + tail,
 			first, MSG_NOSIGNAL);
-	if(sent < 0)
-		return -1;
+
+	if(sent < 0) {
+		if(errno == EAGAIN || errno == EWOULDBLOCK) {
+			schedi_epoll_mod(_socket->fd, _socket->data_ptr,
+				EPOLLIN|EPOLLOUT|EPOLLONESHOT);
+			return 0;
+		} else {
+			schedi_job_epoll_socket_dead(_socket);
+			return -1;
+		}
+	}
 
 	total = sent;
 	tail = (tail + (int)sent) % SCHEDI_JOB_EPOLL_SOCKET_BUFFERSIZE;
+
+	bool dead = false;
 
 	if((size_t)sent == first && first < sendable) {
 		size_t rest_write = sendable - first;
@@ -976,20 +1288,32 @@ int schedi_job_epoll_socket_write_return(struct schedi_job_epoll_socket* _socket
 		if(sent_rest > 0) {
 			total += sent_rest;
 			tail = (int)sent_rest;
+		} else if(sent_rest < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+			dead = true;
 		}
 	}
 
-	int des_avail;
-	do {
-		des_avail = avail + (int)total;
-	} while(!atomic_compare_exchange_strong_explicit(
-				&_socket->write_htc.avail,
-				&avail, des_avail,
-				memory_order_release, memory_order_relaxed));
-
+	schedi_job_epoll_socket_avail_add(_socket, (int)total, dead);
 	atomic_store(&_socket->write_htc.tail, tail);
+	if(dead)
+		return -1;
 
-	schedi_job_epoll_socket_update_write_ready(_socket, des_avail);
+	htc = atomic_load_explicit(&_socket->htc, memory_order_acquire);
+	avail = schedi_job_epoll_socket_avail_from(htc);
+	if (avail != SCHEDI_JOB_EPOLL_SOCKET_BUFFERSIZE) {
+		schedi_epoll_mod(_socket->fd, _socket->data_ptr,
+				EPOLLIN|EPOLLOUT|
+				EPOLLONESHOT); 	// there are 
+						// some bytes filled up
+						// wake it up
+		// I thought of "goto avail_changed" here but on cases where
+		// socket is not ready, there will come a loop. Instead,
+		// just waking the epoll registiration back up seems logical.
+		//
+		// When theres nothing here, schedi_job_epoll_socket_write
+		// will wake it up when something comes up.
+	}
+
 
 	return (int)total;
 }
@@ -998,8 +1322,8 @@ int schedi_job_epoll_socket_read_return(struct schedi_job_epoll_socket* _socket)
 {
 	int head = atomic_load_explicit(&_socket->read_htc.head,
 			memory_order_acquire);
-	int count = atomic_load_explicit(&_socket->read_htc.count,
-			memory_order_acquire);
+	uint64_t htc = atomic_load_explicit(&_socket->htc, memory_order_acquire);
+	int count = schedi_job_epoll_socket_count_from(htc);
 
 	size_t free = SCHEDI_JOB_EPOLL_SOCKET_BUFFERSIZE - count;
 	size_t total = 0;
@@ -1011,18 +1335,24 @@ int schedi_job_epoll_socket_read_return(struct schedi_job_epoll_socket* _socket)
 
 	ssize_t got = recv(_socket->fd, _socket->read_buffer + head,
 			first, 0);
-	if(got == 0)
+	if(got == 0) {
+		schedi_job_epoll_socket_dead(_socket);
 		return -1;
+	}
 	if(got < 0) {
-		if(errno == EAGAIN || errno == EWOULDBLOCK)
+		if(errno == EAGAIN || errno == EWOULDBLOCK) {
+			schedi_epoll_mod(_socket->fd, _socket->data_ptr,
+					EPOLLIN|EPOLLOUT|EPOLLONESHOT);
 			return 0;
+		}
+		schedi_job_epoll_socket_dead(_socket);
 		return -1;
 	}
 
 	total = got;
 	head = (head + (int)got) % SCHEDI_JOB_EPOLL_SOCKET_BUFFERSIZE;
 
-	int dead = 0;
+	bool dead = false;
 
 	if((size_t)got == first && first < free) {
 		size_t rest_read = free - first;
@@ -1033,37 +1363,66 @@ int schedi_job_epoll_socket_read_return(struct schedi_job_epoll_socket* _socket)
 			total += got_rest;
 			head = (int)got_rest;
 		} else if(got_rest == 0) {
-			dead = 1;
+			dead = true;
 		} else if(errno != EAGAIN && errno != EWOULDBLOCK) {
-			dead = 1;
+			dead = true;
 		}
 	}
 
-	int des_count;
-	do {
-		des_count = count + (int)total;
-	} while(!atomic_compare_exchange_strong_explicit(&_socket->read_htc.count,
-				&count, des_count,
-				memory_order_release, memory_order_relaxed));
+	schedi_job_epoll_socket_count_add(_socket, (int)total, dead);
 
 	atomic_store(&_socket->read_htc.head, head);
-
-	schedi_job_epoll_socket_update_read_ready(_socket, des_count);
 
 	if(dead)
 		return -1;
 
+	// oneshot is on. add it up again. should I set every event up there?
+	// maybe do some #define somewhere not dup(licate) it.
+	schedi_epoll_mod(_socket->fd, _socket->data_ptr, EPOLLIN|EPOLLOUT|
+			EPOLLONESHOT);
+
 	return (int)total;
 }
 
-int schedi_job_epoll_socket_return(struct schedi_job_epoll_socket* req, int events)
+int schedi_job_epoll_socket_return(struct schedi_job_epoll_socket* _socket, int events)
 {
-	// applies
-	
-	// do the action depending on event and use buffers. read with an amount of what
-	// space being left on the buffer. then return.
+	bool dead = false;
 
-	return 1;
+	if(events & EPOLLIN) {
+		if(schedi_job_epoll_socket_read_return(_socket) < 0)
+			dead = true;
+	}
+
+	if(events & EPOLLOUT) {
+		if(schedi_job_epoll_socket_write_return(_socket) < 0)
+			dead = true;
+	}
+
+	if(events & (EPOLLERR | EPOLLHUP) && !(events & (EPOLLIN | EPOLLOUT))) {
+		// when EPOLLIN and EPOLLOUT not triggered and socket died,
+		// setting the socket dead and ready as write and read return
+		// functions doing is not done. So this function just sets the
+		// socket dead+ready for this case only.
+		schedi_job_epoll_socket_dead(_socket);
+		dead = true;
+	}
+
+	if(dead)
+		return -1;
+
+	return 0;
+}
+
+bool schedi_job_epollsocket_accessjob(struct schedi_job_epoll_socket* _socket)
+{
+	if(!schedi_job_mark_access(_socket->job)) {
+		if(_socket->job->gen == _socket->gen) {
+			return true;
+		}
+		schedi_job_unmark_access(_socket->job);
+	}
+
+	return false;
 }
 
 int schedi_job_tool_epollsocket_done(struct schedi_job_epoll_socket* _socket)
@@ -1072,6 +1431,16 @@ int schedi_job_tool_epollsocket_done(struct schedi_job_epoll_socket* _socket)
 	if(p == 1) {
 		// this call made the _socket->fall zero.
 		// so let it burn.
+
+		if(schedi_job_epollsocket_accessjob(_socket)) {
+			if(_socket->htc & SCHEDI_JOB_EPOLL_SOCKET_READY) {
+				// the socket no longer counts toward the packed
+				// available_sockets; the derived READYEPOLLSOCK bit is
+				// recomputed by the CAS update.
+				schedi_job_meta_flag_cas_update(_socket->job, -1, 0, 0, 0, false);
+			}
+			schedi_job_unmark_access(_socket->job);
+		}
 		free(_socket);
 		return 1;
 	}
@@ -1095,14 +1464,15 @@ struct schedi_job *schedi_job_create(void *context, schedi_job_fn run,
 	job->dtor = dtor;
 	job->epoll_list = schedi_job_epoll_requests_list_new();
 
-	for(unsigned int i = 0 ; 
-			i < SCHEDI_JOBS_TOOL_EPOLLSOCKET_COUNT ; i += 1) {
-		job->epoll_sockets[i] = NULL;
-	}
 	job->required_available_sockets = 0;
-	
 
-	atomic_store_explicit(&(job->meta_flag), SCHEDI_JOB_METAFLAG_ALIVE, memory_order_release);
+	// the packed counts start at 0: available_sockets (0) already meets the
+	// zero required_available_sockets and waiting_count (0) means no
+	// outstanding requests, so both derived readiness bits start set.
+	atomic_store_explicit(&(job->meta_flag),
+		SCHEDI_JOB_METAFLAG_ALIVE |
+		SCHEDI_JOB_METAFLAG_READYEPOLLSOCK |
+		SCHEDI_JOB_METAFLAG_READYEPOLLTOOL, memory_order_release);
 
 	return job;
 }
@@ -1148,60 +1518,37 @@ _pop_pick:
 int schedi_job_setready(struct schedi_job* job)
 {
 	// locks this so we can do setting a job ready atomically.
-	int ret;
+	int ret = 0;
 #ifndef LOCKLESS_READYJOB
 	pthread_mutex_lock(&readyjob_mutex);
 #endif /*LOCKLESS_READYJOB*/
-	ret = schedi_job_mark_ready(job);
+	if(schedi_job_mark_ready(job)) ret = -1;
+	job->state = schedi_job_state_readywaiting;
 
-	if(!ret) schedi_cache_job_ready(job);
+	if(!ret) {
+		if(schedi_cache_job_ready(job)) {
+			schedi_job_unmark_ready(job);
+			ret = -2;
+		}
+		// cache failed. unmarking it to indicate.
+		// there will be no way to save this.
+	}
 	// if something else already marked it ready first theres no need to
 	// cache it again as that one will be caching it.
+	
 
 #ifndef LOCKLESS_READYJOB
 	if(!ret) pthread_cond_signal(&readyjob_cond);
 #endif /*LOCKLESS_READYJOB*/
 
 #ifndef LOCKLESS_READYJOB
-	ret |= pthread_mutex_unlock(&readyjob_mutex);
+	if(pthread_mutex_unlock(&readyjob_mutex)) {
+		ret -= 10;
+	}
 #endif /*LOCKLESS_READYJOB*/
 
 	return ret;
 }
-
-
-
-int schedi_job_setready_controlled(struct schedi_job* job)
-{
-	uint32_t meta_flag = atomic_load_explicit(&(job->meta_flag), memory_order_acquire);
-	if(!(meta_flag & SCHEDI_JOB_METAFLAG_READYBASIC))
-		return 1;
-	if(job->epoll_list->waiting_count != 0)
-		return 1;
-
-	return schedi_job_setready(job);
-}
-
-
-int schedi_job_refresh_epollsocket_ready(struct schedi_job* job)
-{
-	int ready_sockets = 0;
-	for(unsigned int i = 0 ; i < SCHEDI_JOBS_TOOL_EPOLLSOCKET_COUNT ;
-			i += 1) {
-		if(!job->epoll_sockets[i]) continue;
-		if(job->epoll_sockets[i]->ready)
-			ready_sockets += 1;
-	}
-
-	if (ready_sockets >= job->required_available_sockets) {
-		return (int)schedi_job_mark_readyepollsock(job);
-	} else {
-		return (int)schedi_job_unmark_readyepollsock(job);
-	}
-}
-
-
-
 
 
 
@@ -1231,8 +1578,6 @@ void schedi_job_completion_indicate(struct schedi_job* job)
 
 void schedi_job_completion_wait(struct schedi_job_completion_indicator* indicator)
 {
-
-
 	pthread_mutex_lock(&indicator->completion_signal_mutex);
 	if(indicator->completion) {
 		goto _end;
