@@ -262,7 +262,7 @@ is important to see the schedi's impact on job scheduling calculation.
 
 On 25 tests, %60.9 average decrease on time with a standard deviation of 0.3.
 
-#### Rest of The Tests
+#### Other Tests
 
 - [4T 4J]: %69.5 average decrease, with stdev of 0.3
 - [7T 7J]: %63.5 average decrease, with stdev of 0.7
