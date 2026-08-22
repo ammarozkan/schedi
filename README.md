@@ -3,10 +3,6 @@
 schedi is an asynchronous multi-thread job scheduling and executing
 system/library.
 
-Currently there's flaws but gonna talk about it and publish the current
-code. I'll try to fix by time.
-
-
 ### Requirements
 
 - ```pthread```
