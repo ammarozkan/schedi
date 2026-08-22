@@ -47,7 +47,7 @@ char* GetThreadName(pid_t pt)
 }
 
 
-#endif /*SCHEDI_LOG_NAMED_THREADS*/
+#endif /* SCHEDI_LOG_NAMED_THREADS */
 
 
 
@@ -70,7 +70,7 @@ static void schedi_flog_explicit(const char* msg, int param,
 	ev->param = param;
 #ifdef SCHEDI_LOG_NAMED_THREADS
 	ev->name = GetThreadName(ev->tid);
-#endif /*SCHEDI_LOG_NAMED_THREADS*/
+#endif /* SCHEDI_LOG_NAMED_THREADS */
 }
 
 void schedi_flog(const char *msg, int param)
@@ -88,17 +88,17 @@ void schedi_ferr(const char* msg, int param)
 void schedi_flog_get(struct schedi_flog_event* events)
 {
 	int i = 0;
-	for(i = 4095 ; i >= 0 ; i -= 1) {
+	for(i = SCHEDI_FLOG_SIZE-1 ; i >= 0 ; i -= 1) {
 		unsigned int j = (flog_head - (unsigned int)i)%SCHEDI_FLOG_SIZE;
-		events[4095-i] = flog_events[j];
+		events[SCHEDI_FLOG_SIZE-1-i] = flog_events[j];
 	}
 }
 
 void schedi_ferr_get(struct schedi_flog_event* events)
 {
 	int i = 0;
-	for(i = 4095 ; i >= 0 ; i -= 1) {
+	for(i = SCHEDI_FLOG_SIZE-1 ; i >= 0 ; i -= 1) {
 		unsigned int j = (ferr_head - (unsigned int)i)%SCHEDI_FLOG_SIZE;
-		events[4095-i] = ferr_events[j];
+		events[SCHEDI_FLOG_SIZE-1-i] = ferr_events[j];
 	}
 }

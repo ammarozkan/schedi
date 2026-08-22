@@ -13,8 +13,9 @@
  * @shutdown:  Non-zero signals the worker to exit its loop.
  * @alive:     Set to 1 while the thread is running, 0 after it exits.
  *
- * Allocated statically in an array by &schedi_worker_init. Each worker
- * spins on @shutdown and sets @alive = 0 just before returning.
+ * Allocated statically in an array by schedi_worker_init(). Each worker
+ * spins on @shutdown (with readyjob_cond if LOCKLESS_READYJOB is not defined)
+ * and sets @alive = 0 just before returning.
  */
 struct schedi_worker_ctx {
 	int id;
@@ -50,7 +51,7 @@ int schedi_worker_initd(void);
  * Sets @shutdown = 1 on every worker, then pthread_joins each one.
  * Safe to call even if no workers were ever started (worker_count == 0).
  *
- * Return: 0 on success, the last errno from pthread_join otherwise.
+ * Return: 0 on success, non-zero on failure.
  */
 int schedi_worker_deinit(void);
 

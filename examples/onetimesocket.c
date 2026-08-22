@@ -46,36 +46,8 @@ struct job_context {
 struct job_context context[JOB_COUNT];
 struct schedi_job_completion_indicator indicator[JOB_COUNT];
 
-
-int create_server(char* ip, uint16_t port)
-{
-	int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
-	if (fd < 0) return -1;
-
-	int opt = 1;
-	setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-
-	struct sockaddr_in addr = { .sin_family = AF_INET, .sin_port = htons(port) };
-	if (inet_pton(AF_INET, ip, &addr.sin_addr) <= 0) {
-		close(fd); return -2;
-	}
-	errno=0;
-	if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-		printf("%i\n",errno);
-		close(fd); return -3;
-	}
-	if (listen(fd, SOMAXCONN) < 0) {
-		close(fd); return -4;
-	}
-	return fd;
-}
-
-int accept_client(int serverfd)
-{
-	int fd = accept4(serverfd, NULL, NULL, SOCK_NONBLOCK);
-	if (fd < 0) return -1;
-	return fd;
-}
+#include "create_server.h"
+#include "accept_client.h"
 
 
 int job_func(struct schedi_job* job)
@@ -87,7 +59,7 @@ int job_func(struct schedi_job* job)
 	printf("Ret Count:%u\t\tError Count:%u\n", job->epoll_list->ret_count, job->epoll_list->err_count);
 
 	if(!context->server_created) {
-		context->serverfd = create_server("0.0.0.0", context->port);
+		context->serverfd = create_server_nonblock("0.0.0.0", context->port);
 		if(context->serverfd < 0) {
 			printf("Unsuccesfull server. %i\n", context->serverfd);
 			return 0;
@@ -101,7 +73,7 @@ int job_func(struct schedi_job* job)
 	}
 
 	if(!context->client_accepted) {
-		context->clientfd = accept_client(context->serverfd);
+		context->clientfd = accept_client_nonblock(context->serverfd);
 		printf("Client accept:%i\n", context->clientfd);
 		if(context->clientfd == -1) {
 			printf("Unsuccesfull client.\n"); 
@@ -144,10 +116,14 @@ int main()
 		return 1;
 	}
 
+	if(schedi_epoll_thread_init()) {
+		printf("Epoll thread init fail.\n");
+		return 2;
+	}
 
 	if(schedi_worker_init(2)) {
 		printf("Worker init fail.\n");
-		return 2;
+		return 3;
 	}
 
 	struct schedi_job* jobs[JOB_COUNT];
@@ -157,8 +133,6 @@ int main()
 		jobs[i] = get_job(1997+i, i);
 	}
 
-
-	schedi_epoll_loop(); // that would be on seperate thread.
 	for(unsigned int i = 0 ; i < JOB_COUNT ; i += 1) {
 		schedi_job_completion_wait(&indicator[i]);
 	}

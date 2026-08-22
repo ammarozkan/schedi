@@ -134,12 +134,9 @@ int example_job_function (struct schedi_job* job)
                 // of the epoll tool), job will be ready to proceed further and 
                 // will be called again on the closest time.
 
-	return 0;	// returning 0 makes READYBASIC not marked. Returning 0 can be
-                // used to make job depend on something out of the system and
-                // triggering from outside of schedi. To mark READYBASIC,
-                // schedi_job_mark_readybasic() should be called. Job will be
-                // ready to execute when the rest of the readinesses (such as 
-                // epoll requests, and epoll sockets) are also marked.
+	return 0;	// returning 0 makes READYBASIC not marked. As marking
+                // READYBASIC from outside of the system an approach to
+                // consider, it's dangerous due to race of destroy.
 }
 ```
 
@@ -193,7 +190,7 @@ schedi_job_setready(job);
 schedi_job_completion_wait(&indicator);
 ```
 
-#### Epoll Tool
+#### Tool:Epoll
 
 On job ```job```, if a file descriptor ```fd``` for epoll event ```EPOLLIN``` wanted,
 this call can be made inside of job function.
@@ -207,6 +204,91 @@ Note: file descriptor should be non-blocking.
 Then when the epoll loop gets triggered with ```EPOLLIN``` for the file descriptor
 ```fd```, job will be setted ready.
 
+#### Tool:Epoll Socket
+
+On job ```job```, a file descriptor ```fd``` can be registered to the socket
+system to make job ready if that file descriptor provided at least a number of
+bytes or when it complies a minimum count of bytes requirement on writing.
+Uses an inner buffer system.
+
+
+In a job function, entry a socket as an epoll socket with:
+
+```C
+int minimum_read_buffer_count = 20;
+int minimum_write_buffer_emptiness_count = 0;
+struct schedi_job_epollsocket* socket = schedi_job_tool_epollsocket(
+    job, 
+    fd, 
+    minimum_read_buffer_count,
+    minimum_write_buffer_emptiness_count);
+```
+
+Here, ```socket``` should be saved so it will be used on read and write
+operations. The example code above sets that socket will be ready when
+20 bytes of data is ready to read from buffer and when at least 0 byte
+of data can be written to the buffer (for write operations).
+
+Then to set job's required available sockets (required ready socket count)
+use:
+
+```
+schedi_job_required_available_socket(job, 1);
+```
+
+1 is the required available socket count. When at least 1 socket is ready,
+socket readiness will be marked. And when everything else is ready too,
+job will be ready to execute.
+
+Then reading and writing is the same as the standard read() and write()
+functions.
+
+```
+schedi_job_epollsocket_read(socket, data, 20);
+schedi_job_epollsocket_write(socket, data, 20);
+```
+
+When the minimum counts are determined, those functions are guaranteed to be
+used and successfully done as those counts when job became ready on those
+filters. (such as if minimum_write_buffer_count = 20, 
+schedi_job_epollsocket_write with 20 is guaranteed to work and output 20 if
+this socket is waited to make job ready.) Also those functions are 
+non-blocking. So when requested 20 byte is not ready, it will read less than 
+20.
+
+##### Destroy of Epoll System after use of Epoll Sockets
+
+To mark a socket to be destroyed after use, call:
+
+```
+schedi_job_epollsocket_done(socket);
+```
+
+Then socket will be accepted as not ready until it is destroyed. To be sure
+socket is destroyed before exiting a job, set ```required_available_socket```
+with counting this socket too.
+
+#### Tool:Jobs
+
+Just like how Epoll Sockets or Epolls can be waited to make a job ready, a job
+can also be waited. Assuming ```parent``` is a parent job that is waiting
+```job1```, ```job2``` and ```job3```; by using this scheme on the parent's
+job function:
+
+```C
+schedi_job_tool_job(parent, job1);
+schedi_job_tool_job(parent, job2);
+schedi_job_tool_job(parent, job3);
+schedi_job_setready(job1);
+schedi_job_setready(job2);
+schedi_job_setready(job3);
+schedi_job_required_available_jobs(parent, 3);
+return 1;
+```
+
+the next execution of job function will be when at least 3 jobs completed among
+the jobs specified with schedi_job_tool_job(). In this example, all of those
+jobs needed to be completed to make this job function executed again.
 
 #### Details on Destruction
 
@@ -216,8 +298,6 @@ could belong to other jobs. Guarantee can be made with ```job->gen```. This is a
 id and increases when a destructive operation has been made to the job. So for every 
 pointer, every gen represents a unique job.
 
-
-
 ### Tests and Benefits
 
 schedi's intention is to get a beautiful asynchronous execution with different
@@ -225,7 +305,7 @@ jobs. But as a side effect, performance can also be gained by seperating a job
 that has some independent parts from each other and could execute flawlessly as 
 seperated jobs with executing them asynchronously.
 
-Tests has ben made with ```Intel Pentium N3710```.
+Tests has ben made with ```AMD Ryzen 5 2600```.
 
 #### 100 Million Double Vector Randomization and Dot Product
 
@@ -240,47 +320,40 @@ them executed by schedi system.
 The same problem is solved with single-thread approach on 
 ```examples/aparalleljob_mono.c``` also to compare them.
 
-#### 1 Threads 1 Jobs
+On tests, convention is [nT nJ] with T representing used worker threads that
+gets a job and executes it and J representing jobs that the problem is divided
+to.
 
-Job seperated to 1 thread and 1 jobs. So job is not seperated. schedi is
-just being used to call the function.
+##### AMD Ryzen 5 2600
 
-On 25 tests, 9.6% average increase on time with a standard deviation of 2.4.
+- [1T 1J]: 0.34% average increase. (stdev=0.77)
+- [2T 2J]: 44.29% average decrease. (stdev=0.64)
+- [3T 3J]: 59.52% average decrease. (stdev=0.42)
+- [4T 4J]: 67.43% average decrease. (stdev=0.43)
+- [7T 7J]: 76.03% average decrease. (stdev=0.44)
+- [10T 10J]: 80.14% average decrease. (stdev=0.26)
+- [16T 16J]: 80.90% average decrease. (stdev=0.32)
+- [16T 32J]: 80.90% average decrease. (stdev=0.29)
+- [32T 32J]: 81.48% average decrease. (stdev=0.30)
+- [64T 64J]: 81.73% average decrease. (stdev=0.27)
+- [128T 128J]: 81.86% average decrease. (stdev=0.21)
+- [1024T 1024J]: 38.92% average increase. (stdev=5.50)
+- [16T 1024J]: 39.30% average increase. (stdev=5.84)
 
-#### 2 Threads 2 Jobs
+##### Intel Pentium N3710
 
-Job seperated to 2 thread with 2 jobs. Job is seperated (as can be seen on
-the code) by whole 2 memory parts to not spend time with distanced positions
-on each thread.
-
-On 25 tests, %44.6 average decrease on time with a standard deviation of 0.2.
-
-#### 3 Threads 3 Jobs
-
-Tested CPU contains 2 cores. 3 threads won't have a logical increase. But it
-is important to see the schedi's impact on job scheduling calculation.
-
-On 25 tests, %60.9 average decrease on time with a standard deviation of 0.3.
-
-#### Other Tests
-
-- [4T 4J]: %69.5 average decrease, with stdev of 0.3
-- [7T 7J]: %63.5 average decrease, with stdev of 0.7
-- [10T 10J]: %66.2 average decrease, with stdev of 0.9
-- [16T 16J]: %66.9 average decrease, with stdev 1.4
-- [32T 32J]: %66.0 average decrease with stdev 1.5
-- [64T 64J]: %64.7 average decrease with stdev 1.0
-- [128T 128J]: %64.7 average decrease with stdev 1.0
-
-
+- [1T 1J]: 9.6% average increase. (stdev=2.4)
+- [2T 2J]: 44.6% average decrease. (stdev=0.2)
+- [3T 3J]: 60.9% average decrease. (stdev=0.3)
+- [4T 4J]: 69.5% average decrease. (stdev=0.3)
+- [7T 7J]: 63.5% average decrease. (stdev=0.7)
+- [10T 10J]: 66.2% average decrease. (stdev=0.9)
+- [16T 16J]: 66.9% average decrease. (stdev=1.4)
+- [32T 32J]: 66.0% average decrease. (stdev=1.5)
+- [64T 64J]: 64.7% average decrease. (stdev=1.0)
+- [128T 128J]: 64.7% average decrease. (stdev=1.0)
 
 ### Flaws
-
-#### epoll socket system is not tested yet
-
-epoll socket system provides a persistent epoll registeration with specifying
-required data amount for a socket to make a job ready is done but not tested
-yet and may contain faulty parts.
 
 #### Job Ready Cache Being Full
 
@@ -294,8 +367,3 @@ the workers? Workers should work. It's their job.
 If theres a problem but couldnt being figured out, think about checking if
 job cache is full or not. If it is, try triggering jobs to be cached by
 touching them after a time.
-
-#### shutdown race
-
-Worker has an issue of racing with shutdown flag when sleeping is used 
-for job waiting.

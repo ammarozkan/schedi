@@ -5,8 +5,8 @@
 #ifdef LOCKLESS_READYJOB
 #ifdef SCHEDULE_NONBUSY
 #include <sched.h>
-#endif /*SCHEDULE_NONBUSY*/
-#endif /*LOCKLESS_READYJOB*/
+#endif /* SCHEDULE_NONBUSY */
+#endif /* LOCKLESS_READYJOB */
 
 static struct schedi_worker_ctx workers[SCHEDI_MAX_WORKERS];
 static int worker_count;
@@ -31,51 +31,22 @@ static void *worker_routine(void *arg)
 		goto _continue;
 #else
 
-
 		schedi_pickingreadyjob();
 		job = schedi_job_pickready();
-		if (!job) {
+		if(!job) {
+			if(ctx->shutdown) {
+				schedi_pickedreadyjob();
+				break;
+			}
+			schedi_waitforjob();
 
-			//if(ctx->shutdown) break; 	// second test for ISSUE_WORKER_SHUTDOWN_RACE.
-
-			// ISSUE_WORKER_SHUTDOWN_RACE happens here too.
-			// As my testing, with 9/47 probability it misses here again (on 128 thread)
-			// Current 100% solution to this that I could think of is to 
-			// clear ready job cache so no job could be popped out and wait
-			// 1 second. We can partially more guarantee that threads will be
-			// hitted that conditional sleep. Then mark shutdown, wake them
-			// all up. But this is again a coincidence because 1 second
-			// does not really guarantee that the threads will continue working.
-			// OS may decide that threads will not be executed inside of that
-			// time interval. Even 30 seconds does not guarantee that.
-			// (a bit extremism here)
-
-#ifndef LOCKLESS_READYJOB
-			schedi_waitforjob(); 	// also unlock readyjob_lock
-#endif /*LOCKLESS_READYJOB*/
-						
-						// I thought that maybe I could
-						// check shutdown and go to picking
-						// without an unlock. But maybe 
-						// giving a space to other waiters
-						// more efficient.
-						// When the codebase comes to a
-						// state that those optimizations could
-						// be tested, change and test them.
-						// I will call this ISSUE_SHUTDOWN_CHECK_ON_LOCK_WORKER
-						// Is doing appropriate things
-						// then picking a job without leaving 
-						// the lock, or leaving the lock and 
-						// going back from all over more efficient?
-						// Actually it seems like obvious that
-						// holding the lock while doing all
-						// the checks a bit stupid.
 			goto _continue;
 		} else {
-			schedi_flog("worker_routine schedi_pickedreadyjob()",0);
+			schedi_flog("worker_routine schedi_pickedreadyjob()", 0);
 			schedi_pickedreadyjob();
 		}
-#endif /*LOCKLESS_READYJOB*/
+
+#endif /* LOCKLESS_READYJOB */
 
 _got_a_job:
 		job->state = schedi_job_state_working;
@@ -90,6 +61,16 @@ _got_a_job:
 		if(ret < 0) {
 			schedi_flog("schedi_job_fn returned <0. Indicating completion.", 0);
 			schedi_job_completion_indicate(job);
+
+			if(job->requested_job) {
+				struct schedi_job *rjob = job->requested_job;
+				if(schedi_job_mark_access(rjob) == 0) {
+					if(rjob->gen == job->requested_job_gen)
+						schedi_job_add_available_job(rjob);
+					schedi_job_unmark_access(rjob);
+				}
+			}
+
 			schedi_flog("Triggering destroy.",0);
 			ret = schedi_job_destroy(job);
 			schedi_flog("schedi_job_destroy called. (code:schedi_job_destroy(job))",ret);
@@ -109,8 +90,8 @@ _continue:
 #ifdef LOCKLESS_READYJOB
 #ifdef SCHEDULE_NONBUSY
 		sched_yield(); // on linux, always success
-#endif /*SCHEDULE_NONBUSY*/
-#endif /*LOCKLESS_READYJOB*/
+#endif /* SCHEDULE_NONBUSY */
+#endif /* LOCKLESS_READYJOB */
 
 	}
 
@@ -155,17 +136,24 @@ int schedi_worker_deinit(void)
 {
 	schedi_flog("schedi_worker_deinit call",0);
 	int ret = 0;
-
+#ifndef LOCKLESS_READYJOB
+	if(ret = schedi_lock_readyjob_mutex()) {
+		schedi_flog("schedi_lock_readyjob_mutex() returned an error. (code:err)", ret);
+	}
+#endif /* LOCKLESS_READYJOB */
 	for (int i = 0; i < worker_count; i++)
 		workers[i].shutdown = 1;
 	schedi_flog("schedi_worker_deinit, shutdown marked for all workers.",0);
 	schedi_flog("Waking up all the workers that are sleeping for job waiting safely.", 0);
 
 #ifndef LOCKLESS_READYJOB
-	if(ret = schedi_wake_all_job_waiters()) {
+	if(ret = schedi_wake_all_job_waiters_lockless()) {
 		schedi_flog("schedi_wake_all_job_waiters() returned an error. (code:err)", ret);
 	}
-#endif /*LOCKLESS_READYJOB*/
+	if(ret = schedi_unlock_readyjob_mutex()) {
+		schedi_flog("schedi_unlock_readyjob_mutex() returned an error. (code:err)", ret);
+	}
+#endif /* LOCKLESS_READYJOB */
 
 	for (int i = 0; i < worker_count; i++) {
 		schedi_flog("schedi_worker_deinit, worker joining. (code:worker indice)",i);

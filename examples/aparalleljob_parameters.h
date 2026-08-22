@@ -1,10 +1,15 @@
+/**
+ * aparalleljob.c's parameters to quickly change them.
+ */
+
+
 #define VECTOR_COUNT 130000000
 
 
-#define EQUALITY 128
+#define EQUALITY 16
 
-#define PARALLEL_JOB_COUNT EQUALITY
-#define THREAD_COUNT EQUALITY
+#define PARALLEL_JOB_COUNT 32
+#define THREAD_COUNT 16
 
 
 

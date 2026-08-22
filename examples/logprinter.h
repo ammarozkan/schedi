@@ -1,3 +1,7 @@
+/**
+ * A function that prints the whole flog with prettiness.
+ */
+
 #include <schedi/log.h>
 
 void LogPrint()
@@ -9,6 +13,7 @@ void LogPrint()
 
 	for(unsigned int i = 0 ; i < SCHEDI_FLOG_SIZE ; i += 1) {
 		if (events[i].tid == 0) continue;
-		printf("Event from tid [%i]:[%s] with code %i\n", events[i].tid, events[i].msg,events[i].param);
+		printf("Event from tid [%i]:[%s] with code %i\n", 
+				events[i].tid, events[i].msg,events[i].param);
 	}
 }

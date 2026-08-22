@@ -1,7 +1,7 @@
 CC      ?= gcc
 CFLAGS  ?= -g
 CPPFLAGS := -I include
-SCHEDIFLAGS := -DLOCKLESS_READYJOB
+#SCHEDIFLAGS := -DLOCKLESS_READYJOB
 LDFLAGS := -pthread
 
 SRC := $(wildcard src/*.c)
@@ -23,10 +23,6 @@ build:
 	mkdir -p build
 
 bin/%: examples/%.c libschedi.a | bin
-	$(CC) $(CFLAGS) $(CPPFLAGS) $(SCHEDIFLAGS) -o $@ $< libschedi.a $(LDFLAGS)
-
-
-gprof/%: examples/%.c libschedi.a | bin
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(SCHEDIFLAGS) -o $@ $< libschedi.a $(LDFLAGS)
 
 bin:
