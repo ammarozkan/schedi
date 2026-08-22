@@ -305,8 +305,6 @@ jobs. But as a side effect, performance can also be gained by seperating a job
 that has some independent parts from each other and could execute flawlessly as 
 seperated jobs with executing them asynchronously.
 
-Tests has ben made with ```AMD Ryzen 5 2600```.
-
 #### 100 Million Double Vector Randomization and Dot Product
 
 Problem is setting a vector on two seperate arrays and making a dot product
