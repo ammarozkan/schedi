@@ -319,7 +319,7 @@ struct schedi_job {
 	_Atomic enum schedi_job_state state;
 	_Atomic uint32_t meta_flag;
 
-	struct schedi_job_epoll_requests_list *epoll_list;
+	struct schedi_job_epoll_requests_list epoll_list;
 
 	// ready sockets are counted individually; if the ready socket count
 	// reaches required_available_sockets, the derived READYEPOLLSOCK bit is
@@ -1079,20 +1079,6 @@ void schedi_job_completion_indicate(struct schedi_job* job);
 void schedi_job_completion_wait(struct schedi_job_completion_indicator* indicator);
 
 
-
-/**
- * schedi_job_epoll_requests_list_new() - Allocate and initialise an epoll
- * requests list.
- *
- * Allocates a struct schedi_job_epoll_requests_list on the heap and zeroes
- * the request counters.
- *
- * The caller must call schedi_job_epoll_requests_list_destroy() to tear it
- * down.
- *
- * Return: a pointer on success, NULL on failure.
- */
-struct schedi_job_epoll_requests_list *schedi_job_epoll_requests_list_new(void);
 
 /**
  * schedi_job_epoll_requests_list_destroy() - Free an epoll requests list.

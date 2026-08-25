@@ -839,15 +839,14 @@ int schedi_job_destroy_now(struct schedi_job* job)
 	atomic_fetch_add_explicit(&job->gen, 1, memory_order_release);
 
 	job->state = schedi_job_state_destroying;
-	section_release(job - job_array.jobs);
-
-	schedi_job_epoll_requests_list_destroy(job->epoll_list);
 
 	if (job->dtor)
 		job->dtor(job->context);
 
 	job->state = schedi_job_state_nulljob;
 	atomic_store_explicit(&(job->meta_flag), 0, memory_order_release);
+	
+	section_release(job - job_array.jobs);
 	return 1;
 }
 
@@ -962,7 +961,7 @@ int schedi_job_tool_epoll(struct schedi_job *job, int socketfd, uint32_t events)
 	req->socketfd = socketfd;
 	req->owner = job;
 	req->job_gen = atomic_load_explicit(&(job->gen), memory_order_acquire);
-	req->list = job->epoll_list;
+	req->list = &job->epoll_list;
 
 	struct schedi_job_epoll_requests_list *list = req->list;
 	atomic_fetch_add_explicit(&list->total_req, 1, memory_order_relaxed);
@@ -991,18 +990,6 @@ int schedi_job_tool_epoll(struct schedi_job *job, int socketfd, uint32_t events)
 	}
 
 	return 0;
-}
-
-struct schedi_job_epoll_requests_list *schedi_job_epoll_requests_list_new(void)
-{
-	struct schedi_job_epoll_requests_list *list = malloc(sizeof(*list));
-	if (!list)
-		return NULL;
-
-	list->total_req = 0;
-	list->ret_count = 0;
-	list->err_count = 0;
-	return list;
 }
 
 void schedi_job_epoll_requests_list_destroy(struct schedi_job_epoll_requests_list *list)
@@ -1613,7 +1600,10 @@ struct schedi_job *schedi_job_create(void *context, schedi_job_fn run,
 	job->context = context;
 	job->run = run;
 	job->dtor = dtor;
-	job->epoll_list = schedi_job_epoll_requests_list_new();
+
+	job->epoll_list.total_req = 0;
+	job->epoll_list.ret_count = 0;
+	job->epoll_list.err_count = 0;
 
 	job->required_available_sockets = 0;
 	job->required_available_jobs = 0;

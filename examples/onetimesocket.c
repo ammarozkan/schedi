@@ -54,9 +54,9 @@ int job_func(struct schedi_job* job)
 {
 	struct job_context* context = (struct job_context*)job->context;
 
-	printf("Total Req:%u\t\tWaiting:%u\n", job->epoll_list->total_req,
+	printf("Total Req:%u\t\tWaiting:%u\n", job->epoll_list.total_req,
 		SCHEDI_JOB_METAFLAG_GETWAIT(atomic_load_explicit(&job->meta_flag, memory_order_relaxed)));
-	printf("Ret Count:%u\t\tError Count:%u\n", job->epoll_list->ret_count, job->epoll_list->err_count);
+	printf("Ret Count:%u\t\tError Count:%u\n", job->epoll_list.ret_count, job->epoll_list.err_count);
 
 	if(!context->server_created) {
 		context->serverfd = create_server_nonblock("0.0.0.0", context->port);

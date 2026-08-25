@@ -104,8 +104,8 @@ static void schedi_epoll_handle_read(struct epoll_event *ev, int epfd)
 	case SCHEDI_EPOLL_DATA_JOB: {
 		struct schedi_job_epoll_request *req = d->as.ptr;
 
-		schedi_job_epoll_request_return(req, error);
 		schedi_epoll_del(req->socketfd);
+		schedi_job_epoll_request_return(req, error);
 		free(req);
 		free(d);
 		break;
@@ -140,8 +140,8 @@ static void schedi_epoll_handle_write(struct epoll_event *ev, int epfd)
 	case SCHEDI_EPOLL_DATA_JOB: {
 		struct schedi_job_epoll_request *req = d->as.ptr;
 
-		schedi_job_epoll_request_return(req, error);
 		schedi_epoll_del(req->socketfd);
+		schedi_job_epoll_request_return(req, error);
 		free(req);
 		free(d);
 		break;
