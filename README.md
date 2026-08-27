@@ -1,15 +1,22 @@
 ## schedi
 
 schedi is an asynchronous multi-thread job scheduling and executing
-system/library.
+system/library with integration to epoll.
+
+Serves:
+- job creation, 
+- waiting a job to be completed without consuming any CPU,
+- making a job wait a while until a required amount of data is received from a
+socket, 
+- timing out a socket if that socket is not becoming ready for a specific
+amount of time,
+- making a job wait a until the specified jobs become ready.
 
 ### Requirements
 
 - ```pthread```
-- ```linux epoll```: Code uses epolls. But epoll can also be extracted
-as schedi does not depend on epolls. epoll is just a tool inside of
-schedi.
-
+- ```linux epoll```: Integration with epoll mechanism requires linux epoll
+but it is easily pullable out from the codebase.
 
 ### Compiling
 
@@ -40,6 +47,10 @@ found a job. Normally workers sleep until there is a job. This sleep
 approach depends heavily on mutexes. For constantly checking if theres 
 a job or not and use lockless ready job caches etc, use this.
 
+##### SCHEDI_EXT_TIMEOUT
+
+Define this on compilation to enable the timeout extension for epollsocket
+system. Details are at below.
 
 ### Usage
 
@@ -285,6 +296,43 @@ return 1;
 the next execution of job function will be when at least 3 jobs completed among
 the jobs specified with schedi_job_tool_job(). In this example, all of those
 jobs needed to be completed to make this job function executed again.
+
+#### TimeOut Extension
+
+When library is compiled with ```-DSCHEDI_EXT_TIMEOUT```, epollsocket system
+will gain some use and behaviour changes to use a timeout mechanism.
+
+Entrying an epollsocket expands to
+
+```
+time_t timeout_time_in_seconds = 5;
+schedi_job_tool_epollsocket(
+    job,
+    fd,
+    minimum_read_buffer_count,
+    minimum_write_buffer_emptiness_count,
+    timeout_time_in_seconds);
+```
+
+In this example, 5 seconds of inactivity while socket is not ready will pop the 
+socket out of epoll mechanism and will be counted as a ready socket.
+
+To not use timeout in a socket with use of ```-DSCHEDI_EXT_TIMEOUT```, zero can
+be putted to the timeout time to not arm the timer.
+
+When a socket's time is out but socket was ready when the time out happened,
+timer will be resetted and socket will continue existing on the epoll
+mechanism.
+
+To add a socket (that is popped out by the timeout) back to the epoll 
+mechanism, use:
+
+```
+int schedi_job_epollsocket_epollagain(struct schedi_epollsocket *_socket);
+```
+
+Returns non-zero if epoll addition failed or socket was not containing epolldid
+mark, indicating that epoll mechanism didn't popped it out.
 
 #### Details on Destruction
 

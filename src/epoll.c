@@ -38,6 +38,14 @@ void schedi_epoll_del_write(int fd)
 	epoll_ctl(epfd_write, EPOLL_CTL_DEL, fd, NULL);
 }
 
+void schedi_epoll_del_socketcompletely(struct schedi_job_epollsocket *socket)
+{
+	schedi_epoll_del(socket->fd);
+#ifdef SCHEDI_EXT_TIMEOUT
+	schedi_epoll_del_read(socket->to_timer_fd);
+#endif /*SCHEDI_EXT_TIMEOUT*/
+}
+
 int schedi_epoll_add(int fd, struct schedi_epoll_data *data, uint32_t events)
 {
 	int added = -1;
@@ -115,12 +123,36 @@ static void schedi_epoll_handle_read(struct epoll_event *ev, int epfd)
 
 		if(schedi_job_epollsocket_return(sock, evn)) {
 			int fd = sock->fd;
-			schedi_epoll_del_read(fd);
+			schedi_epoll_del_socketcompletely(sock);
 			free(d);
-			schedi_job_epollsocket_done_(sock, true);
+			schedi_job_epollsocket_done_(sock, 
+					EPOLLSOCKET_DONE_EPOLL);
 		}
 		break;
 	}
+#ifdef SCHEDI_EXT_TIMEOUT
+	case SCHEDI_EPOLL_DATA_EPOLLSOCKTO: {
+		struct schedi_job_epollsocket* sock = d->as.ptr;
+
+		// we can do this check here because everything that makes an
+		// epollsocket ready is in this thread and when the execution
+		// is here, there is no way for a race to be happened. So if
+		// socket is timed out after being ready, this is not socket's
+		// fault. Socket is a good little fella doing its job.
+		if(schedi_job_epollsocket_ready(sock)) {
+			schedi_job_epollsocket_timeout_reset(sock);
+			break;
+		}
+
+
+		schedi_job_epollsocket_timeout_cas(sock);
+		schedi_epoll_del_socketcompletely(sock);
+		free(d);
+		schedi_job_epollsocket_done_(sock,
+				EPOLLSOCKET_DONE_EPOLL);
+		break;
+	}
+#endif /*SCHEDI_EXT_TIMEOUT*/
 	default:
 		free(d);
 		break;
@@ -151,9 +183,10 @@ static void schedi_epoll_handle_write(struct epoll_event *ev, int epfd)
 
 		if(schedi_job_epollsocket_return(sock, evn)) {
 			int fd = sock->fd;
-			schedi_epoll_del_write(fd);
+			schedi_epoll_del_socketcompletely(sock);
 			free(d);
-			schedi_job_epollsocket_done_(sock, true);
+			schedi_job_epollsocket_done_(sock, 
+					EPOLLSOCKET_DONE_EPOLL);
 		}
 		break;
 	}

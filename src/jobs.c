@@ -5,7 +5,13 @@
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <stdbool.h>
+#include <unistd.h>
 #include <sys/socket.h>
+#ifdef SCHEDI_EXT_TIMEOUT
+#include <sys/timerfd.h>
+#else
+#include <assert.h> // will be removed
+#endif /*SCHEDI_EXT_TIMEOUT*/
 #include <string.h>
 
 /*
@@ -35,7 +41,8 @@ static struct {
 				// extra protection.
 } dq;
 
-_Static_assert(ATOMIC_LLONG_LOCK_FREE == 2, "CPU with lockless atomic long long support would be great.");
+_Static_assert(ATOMIC_LLONG_LOCK_FREE == 2, 
+		"CPU with lockless atomic long long support would be great.");
 
 static size_t min(size_t a, size_t b)
 {
@@ -1015,8 +1022,15 @@ static void schedi_job_epollsocket_jobready_update(
 		struct schedi_job_epollsocket* _socket,
 		uint64_t old_htc, uint64_t new_htc)
 {
+#ifdef SCHEDI_EXT_TIMEOUT
+	// ..._jobready_update function is called on every actionistic path on
+	// epoll socket. So this call here is good to reset the timeout timer.
+	schedi_job_epollsocket_timeout_reset(_socket);
+#endif /*SCHEDI_EXT_TIMEOUT*/
+	
 	bool old_ready = old_htc & SCHEDI_JOB_EPOLLSOCKET_READY;
 	bool new_ready = new_htc & SCHEDI_JOB_EPOLLSOCKET_READY;
+
 
 	if(old_ready == new_ready)
 		return;
@@ -1041,6 +1055,10 @@ static void schedi_job_epollsocket_avail_add(
 	uint64_t htc = atomic_load_explicit(&_socket->htc, memory_order_acquire);
 	uint64_t des_htc;
 	do {
+#ifdef SCHEDI_EXT_TIMEOUT
+		if(htc & SCHEDI_JOB_EPOLLSOCKET_TIMEOUT) return;
+#endif /*SCHEDI_EXT_TIMEOUT*/
+
 		int des_avail = schedi_job_epollsocket_avail_from(htc) + delta;
 		bool write_ready = (uint32_t)des_avail >= _socket->write_avail_condition;
 		bool read_ready = htc & SCHEDI_JOB_EPOLLSOCKET_READ_READY;
@@ -1092,6 +1110,9 @@ static void schedi_job_epollsocket_count_add(
 	uint64_t htc = atomic_load_explicit(&_socket->htc, memory_order_acquire);
 	uint64_t des_htc;
 	do {
+#ifdef SCHEDI_EXT_TIMEOUT
+		if(htc & SCHEDI_JOB_EPOLLSOCKET_TIMEOUT) return;
+#endif /*SCHEDI_EXT_TIMEOUT*/
 		int des_count = schedi_job_epollsocket_count_from(htc) + delta;
 		bool read_ready = (uint32_t)des_count >= _socket->read_count_condition;
 		bool write_ready = htc & SCHEDI_JOB_EPOLLSOCKET_WRITE_READY;
@@ -1136,12 +1157,61 @@ void schedi_job_epollsocket_done_cas_jobside(
 	uint64_t des_htc;
 	do {
 		des_htc = htc | SCHEDI_JOB_EPOLLSOCKET_EPOLLNT;
-		if(des_htc & SCHEDI_JOB_EPOLLSOCKET_EPOLLDID) {
+		if(!(des_htc & SCHEDI_JOB_EPOLLSOCKET_EPOLLDID)) {
 			des_htc &= ~SCHEDI_JOB_EPOLLSOCKET_READY;
 		}
 	} while(!atomic_compare_exchange_strong(&_socket->htc, &htc, des_htc));
 	
 	schedi_job_epollsocket_jobready_update(_socket, htc, des_htc);
+}
+
+#ifdef SCHEDI_EXT_TIMEOUT
+void schedi_job_epollsocket_timeout_cas(
+		struct schedi_job_epollsocket* _socket)
+{
+	uint64_t htc = atomic_load_explicit(&_socket->htc, memory_order_acquire);
+	uint64_t des_htc;
+	do {
+		des_htc = htc | SCHEDI_JOB_EPOLLSOCKET_TIMEOUT
+			| SCHEDI_JOB_EPOLLSOCKET_READY;
+	} while(!atomic_compare_exchange_strong(&_socket->htc, &htc, des_htc));
+
+	schedi_job_epollsocket_jobready_update(_socket, htc, des_htc);
+}
+
+int schedi_job_epollsocket_timeout_reset(
+		struct schedi_job_epollsocket* _socket)
+{
+	struct itimerspec spec = {
+		{0, 0},
+		{_socket->timeout_sec, 0}
+	};
+
+	return timerfd_settime(_socket->to_timer_fd, 0, &spec, NULL);
+}
+
+int schedi_job_epollsocket_timeout_stop(
+		struct schedi_job_epollsocket* _socket)
+{
+	struct itimerspec spec = {
+		{0, 0},
+		{0, 0}
+	};
+
+	return timerfd_settime(_socket->to_timer_fd, 0, &spec, NULL);
+}
+
+int schedi_job_epollsocket_timeout(struct schedi_job_epollsocket* _socket)
+{
+	uint64_t htc = atomic_load(&_socket->htc);
+	return (bool)(htc & SCHEDI_JOB_EPOLLSOCKET_TIMEOUT);
+}
+#endif /*SCHEDI_EXT_TIMEOUT*/
+
+int schedi_job_epollsocket_ready(struct schedi_job_epollsocket* _socket)
+{
+	uint64_t htc = atomic_load(&_socket->htc);
+	return (bool)(htc & SCHEDI_JOB_EPOLLSOCKET_READY);
 }
 
 void schedi_job_tool_epollsocket_read_cond(
@@ -1162,7 +1232,11 @@ void schedi_job_tool_epollsocket_write_cond(
 
 struct schedi_job_epollsocket*
 schedi_job_tool_epollsocket(struct schedi_job* job, int socketfd, 
-		uint32_t read_cond, uint32_t write_cond)
+		uint32_t read_cond, uint32_t write_cond
+#ifdef SCHEDI_EXT_TIMEOUT
+		, time_t timeout_sec
+#endif /*SCHEDI_EXT_TIMEOUT*/
+		)
 {
 	struct schedi_job_epollsocket* sock;
 	sock = (typeof(sock))malloc(sizeof(*sock));
@@ -1188,8 +1262,7 @@ schedi_job_tool_epollsocket(struct schedi_job* job, int socketfd,
 
 	sock->write_avail_condition = write_cond;
 
-	sock->fall = 3;
-	sock->epoll_fall = 2;
+	sock->fall = 2;
 
 	// if the initial state already satisfies both readiness conditions the
 	// socket starts counting toward the job's available_sockets.
@@ -1209,35 +1282,25 @@ schedi_job_tool_epollsocket(struct schedi_job* job, int socketfd,
 		schedi_job_meta_flag_cas_update(job, 1, 0, 0, 0, 0, false);
 	}
 
-	struct schedi_epoll_data* data_read;
-	data_read = (typeof(data_read))malloc(sizeof(*data_read));
-	data_read->type = SCHEDI_EPOLL_DATA_SOCKET;
-	data_read->as.ptr = (void*)sock;
+#ifdef SCHEDI_EXT_TIMEOUT
+	sock->timeout_sec = timeout_sec;
 
-	struct schedi_epoll_data* data_write;
-	data_write = (typeof(data_write))malloc(sizeof(*data_write));
-	data_write->type = SCHEDI_EPOLL_DATA_SOCKET;
-	data_write->as.ptr = (void*)sock;
-
-	sock->data_ptr_read = data_read;
-	sock->data_ptr_write = data_write;
-
-	if (schedi_epoll_add(socketfd, data_read,
-				EPOLLIN|EPOLLONESHOT) < 0) {
-		// data_read freed by schedi_epoll_add()
-		free(data_write);
-		goto fail;
-	}
-	if (schedi_epoll_add(socketfd, data_write,
-				EPOLLOUT|EPOLLONESHOT) < 0) {
-		// data_write freed by schedi_epoll_add()
-		schedi_epoll_del(socketfd);
-		free(data_read);
+	sock->to_timer_fd = timerfd_create(CLOCK_REALTIME, 0);
+	if(sock->to_timer_fd == -1) {
 		goto fail;
 	}
 
+#endif /*SCHEDI_EXT_TIMEOUT*/
+
+	if(schedi_job_epollsocket_epollisize(sock)) {
+		goto fail_epollisize;
+	}
 	return sock;
 
+fail_epollisize:
+#ifdef SCHEDI_EXT_TIMEOUT
+	close(sock->to_timer_fd);
+#endif /*SCHEDI_EXT_TIMEOUT*/
 fail:
 	if(ready)
 		schedi_job_meta_flag_cas_update(job, -1, 0, 0, 0, 0, false);
@@ -1245,17 +1308,159 @@ fail:
 	return NULL;
 }
 
+#ifdef SCHEDI_EXT_TIMEOUT
+/**
+ * schedi_job_epollsocket_untimeout() - Removes the EPOLLDID and TIMEOUT flag.
+ *
+ * Return: 0 if successfully unepolldidded. non-zero if there wasn't
+ * epolldid.
+ */
+static int schedi_job_epollsocket_untimeout(
+		struct schedi_job_epollsocket *_socket)
+{
+	uint64_t htc = atomic_load_explicit(&_socket->htc, memory_order_acquire);
+	uint64_t des_htc;
+	do {
+		bool epolldid = htc & SCHEDI_JOB_EPOLLSOCKET_EPOLLDID;
+		if(!epolldid) return -1;
+
+		des_htc = htc & ~SCHEDI_JOB_EPOLLSOCKET_EPOLLDID & 
+			~SCHEDI_JOB_EPOLLSOCKET_TIMEOUT;
+		epolldid = false;
+
+		bool read_ready = htc & SCHEDI_JOB_EPOLLSOCKET_READ_READY;
+		bool write_ready = htc & SCHEDI_JOB_EPOLLSOCKET_WRITE_READY;
+		bool is_dead = htc & SCHEDI_JOB_EPOLLSOCKET_DEAD;
+
+		bool epollnt = htc & SCHEDI_JOB_EPOLLSOCKET_EPOLLNT;
+		bool ready = (!epollnt ? 
+			(read_ready && write_ready || is_dead) : 0 ) || epolldid;
+
+		des_htc = ready ? (des_htc | SCHEDI_JOB_EPOLLSOCKET_READY) :
+			(des_htc & ~SCHEDI_JOB_EPOLLSOCKET_READY);
+	} while(!atomic_compare_exchange_strong(&_socket->htc, &htc, des_htc));
+	
+	schedi_job_epollsocket_jobready_update(_socket, htc, des_htc);
+
+	return 0;
+}
+#endif /*SCHEDI_EXT_TIMEOUT*/
+
+
+
+int schedi_job_epollsocket_epollagain(struct schedi_job_epollsocket *_socket)
+{
+#ifdef SCHEDI_EXT_TIMEOUT
+	if(schedi_job_epollsocket_untimeout(_socket)) {
+		return -1;
+	}
+#else
+	assert(0); // epollagain does not have a mechanism to make a socket
+		   // ready for non-timeout build.
+#endif /*SCHEDI_EXT_TIMEOUT*/
+
+	int p = atomic_fetch_add(&_socket->fall, 1);
+
+	if(schedi_job_epollsocket_epollisize(_socket)) {
+		// because epollisize not worked, there is no reference
+		// from epoll mechanism to this socket. It's EPOLLDID
+		// again. To revert all the things happened on this function,
+		// call the done like we are the epoll mechanism.
+		schedi_job_epollsocket_done_(_socket, 1);
+		return -1;
+	}
+
+	return 0;
+}
+
+int schedi_job_epollsocket_epollisize(struct schedi_job_epollsocket* _socket)
+{
+
+#ifdef SCHEDI_EXT_TIMEOUT
+	if(schedi_job_epollsocket_timeout_stop(_socket)) {
+		goto fail_epoll_push;
+	}
+
+	if(schedi_job_epollsocket_timer_push_epoll(_socket)) {
+		goto fail_timer_push;
+	}
+#endif /*SCHEDI_EXT_TIMEOUT*/
+
+	if(schedi_job_epollsocket_push_epoll(_socket)) {
+		goto fail_epoll_push;
+	}
+
+#ifdef SCHEDI_EXT_TIMEOUT
+	if(schedi_job_epollsocket_timeout_reset(_socket)) {
+		goto fail_timeout_reset;
+	}
+#endif /*SCHEDI_EXT_TIMEOUT*/
+
+
+	return 0;
+
+fail_timeout_reset:
+	schedi_epoll_del(_socket->fd);
+fail_epoll_push:
+#ifdef SCHEDI_EXT_TIMEOUT
+	schedi_epoll_del_read(_socket->to_timer_fd);
+#endif /*SCHEDI_EXT_TIMEOUT*/
+fail_timer_push:
+	return -1;
+}
+
+
+
+int schedi_job_epollsocket_push_epoll(struct schedi_job_epollsocket *_socket)
+{
+	struct schedi_epoll_data* ep_data;
+	ep_data = (typeof(ep_data))malloc(sizeof(*ep_data));
+
+	ep_data->type = SCHEDI_EPOLL_DATA_SOCKET;
+	ep_data->as.ptr = (void*)_socket;
+
+	_socket->data_ptr = ep_data;
+
+	// ep_data will be freed at schedi_epoll_add.
+	return schedi_epoll_add(_socket->fd, ep_data, 
+			EPOLLIN|EPOLLOUT|EPOLLONESHOT);
+}
+
+#ifdef SCHEDI_EXT_TIMEOUT
+int schedi_job_epollsocket_timer_push_epoll(
+		struct schedi_job_epollsocket *_socket)
+{
+	if(_socket->to_timer_fd < 0) {
+		return -1;
+	}
+
+	struct schedi_epoll_data* timeout_data;
+	timeout_data = (typeof(timeout_data))malloc(sizeof(*timeout_data));
+	timeout_data->type = SCHEDI_EPOLL_DATA_EPOLLSOCKTO;
+	timeout_data->as.ptr = (void*)_socket;
+
+	if(schedi_epoll_add(_socket->to_timer_fd, timeout_data,
+				EPOLLIN) < 0) {
+		// timeout_data is freed by the epoll mechanism.
+		return -1;
+	}
+
+	return 0;
+}
+#endif /*SCHEDI_EXT_TIMEOUT*/
+
 static void schedi_job_epollsocket_epoll_activator(
 		struct schedi_job_epollsocket* _socket)
 {
+	int fd = atomic_load(&_socket->fd);
 	uint64_t htc = atomic_load_explicit(&_socket->htc, memory_order_acquire);
 	if(schedi_job_epollsocket_count_from(htc) 
 			!= SCHEDI_JOB_EPOLLSOCKET_BUFFERSIZE)
-		schedi_epoll_mod(_socket->fd, _socket->data_ptr_read,
+		schedi_epoll_mod(fd, _socket->data_ptr,
 				EPOLLIN|EPOLLONESHOT);
 	if(schedi_job_epollsocket_avail_from(htc) 
 			!= SCHEDI_JOB_EPOLLSOCKET_BUFFERSIZE)
-		schedi_epoll_mod(_socket->fd, _socket->data_ptr_write,
+		schedi_epoll_mod(fd, _socket->data_ptr,
 				EPOLLOUT|EPOLLONESHOT);
 }
 
@@ -1309,7 +1514,8 @@ int schedi_job_epollsocket_write(struct schedi_job_epollsocket* _socket,
 	// if the write buffer is empty, write directly to the socket and send
 	// as much as it can take right now.
 	if(schedi_job_epollsocket_avail_from(htc) == SCHEDI_JOB_EPOLLSOCKET_BUFFERSIZE) {
-		ssize_t sent = send(_socket->fd, data, size, MSG_NOSIGNAL);
+		int fd = atomic_load(&_socket->fd);
+		ssize_t sent = send(fd, data, size, MSG_NOSIGNAL);
 		if(sent > 0) {
 			total = (size_t)sent;
 			data += (size_t)sent;
@@ -1402,7 +1608,8 @@ avail_changed:
 
 	size_t first = min(sendable, SCHEDI_JOB_EPOLLSOCKET_BUFFERSIZE - tail);
 
-	ssize_t sent = send(_socket->fd, _socket->write_buffer + tail,
+	int fd = atomic_load(&_socket->fd);
+	ssize_t sent = send(fd, _socket->write_buffer + tail,
 			first, MSG_NOSIGNAL);
 
 	if(sent < 0) {
@@ -1421,7 +1628,7 @@ avail_changed:
 
 	if((size_t)sent == first && first < sendable) {
 		size_t rest_write = sendable - first;
-		ssize_t sent_rest = send(_socket->fd,
+		ssize_t sent_rest = send(fd,
 				_socket->write_buffer,
 				rest_write, MSG_NOSIGNAL);
 		if(sent_rest > 0) {
@@ -1437,12 +1644,8 @@ avail_changed:
 	if(dead)
 		return -1;
 
-	htc = atomic_load_explicit(&_socket->htc, memory_order_acquire);
-	avail = schedi_job_epollsocket_avail_from(htc);
-
 	return (int)total;
 }
-
 
 int schedi_job_epollsocket_read_return(struct schedi_job_epollsocket* _socket)
 {
@@ -1459,7 +1662,8 @@ int schedi_job_epollsocket_read_return(struct schedi_job_epollsocket* _socket)
 
 	size_t first = min(free, SCHEDI_JOB_EPOLLSOCKET_BUFFERSIZE - head);
 
-	ssize_t got = recv(_socket->fd, _socket->read_buffer + head,
+	int fd = atomic_load(&_socket->fd);
+	ssize_t got = recv(fd, _socket->read_buffer + head,
 			first, 0);
 	if(got == 0) {
 		schedi_job_epollsocket_dead(_socket);
@@ -1480,7 +1684,7 @@ int schedi_job_epollsocket_read_return(struct schedi_job_epollsocket* _socket)
 
 	if((size_t)got == first && first < free) {
 		size_t rest_read = free - first;
-		ssize_t got_rest = recv(_socket->fd,
+		ssize_t got_rest = recv(fd,
 				_socket->read_buffer,
 				rest_read, 0);
 		if(got_rest > 0) {
@@ -1506,17 +1710,7 @@ int schedi_job_epollsocket_read_return(struct schedi_job_epollsocket* _socket)
 int schedi_job_epollsocket_return(struct schedi_job_epollsocket* _socket, int events)
 {
 	bool dead = false;
-
-	if(events & EPOLLIN) {
-		if(schedi_job_epollsocket_read_return(_socket) < 0)
-			dead = true;
-	}
-
-	if(events & EPOLLOUT) {
-		if(schedi_job_epollsocket_write_return(_socket) < 0)
-			dead = true;
-	}
-
+	
 	if(events & (EPOLLERR | EPOLLHUP) && !(events & (EPOLLIN | EPOLLOUT))) {
 		// when EPOLLIN and EPOLLOUT not triggered and socket died,
 		// setting the socket dead and ready as write and read return
@@ -1526,8 +1720,17 @@ int schedi_job_epollsocket_return(struct schedi_job_epollsocket* _socket, int ev
 		dead = true;
 	}
 
-	schedi_job_epollsocket_epoll_activator(_socket);
+	else if(events & EPOLLIN) {
+		if(schedi_job_epollsocket_read_return(_socket) < 0)
+			dead = true;
+	}
 
+	else if(events & EPOLLOUT) {
+		if(schedi_job_epollsocket_write_return(_socket) < 0)
+			dead = true;
+	}
+
+	schedi_job_epollsocket_epoll_activator(_socket);
 
 	if(dead)
 		return -1;
@@ -1547,43 +1750,30 @@ bool schedi_job_epollsocket_accessjob(struct schedi_job_epollsocket* _socket)
 	return false;
 }
 
-
 int schedi_job_epollsocket_done_(struct schedi_job_epollsocket* _socket, 
-		bool epollside)
+		int epollside)
 {
+	if(epollside == 0) {
+		schedi_job_epollsocket_done_cas_jobside(_socket);
+	} else {
+		schedi_job_epollsocket_done_cas_epollside(_socket);
+	}
+
 	int p = atomic_fetch_sub(&_socket->fall, 1);
 	if(p == 1) {
 		// this call made the _socket->fall zero.
 		// so let it burn.
-
-		if(schedi_job_epollsocket_accessjob(_socket)) {
-			if(_socket->htc & SCHEDI_JOB_EPOLLSOCKET_EPOLLNT) {
-				schedi_job_meta_flag_cas_update(_socket->job, 
-						+1, 0, 0, 0, 0, false);
-			}
-			schedi_job_unmark_access(_socket->job);
-		}
+		
 		free(_socket);
 		return 0;
 	}
 
-	switch(epollside) {
-		case false:
-			schedi_job_epollsocket_done_cas_jobside(_socket);
-			break;
-		case true:
-			// the socket has two epoll registrations (read + write); only
-			// the last one dropping marks the socket delivered (EPOLLDID).
-			if(atomic_fetch_sub(&_socket->epoll_fall, 1) == 1)
-				schedi_job_epollsocket_done_cas_epollside(_socket);
-			break;
-	}
 	return -1;
 }
 
 int schedi_job_epollsocket_done(struct schedi_job_epollsocket* _socket)
 {
-	return schedi_job_epollsocket_done_(_socket, false);
+	return schedi_job_epollsocket_done_(_socket, 0);
 }
 
 struct schedi_job *schedi_job_create(void *context, schedi_job_fn run,

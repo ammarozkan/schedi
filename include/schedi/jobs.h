@@ -15,6 +15,9 @@
 // on quick checks.
 #define SCHEDI_JOBS_CACHE_CHECK 16
 
+#define EPOLLSOCKET_DONE_JOBSIDE	0
+#define EPOLLSOCKET_DONE_EPOLL 		1
+
 // buffer size for each read and write operation on epollsocket system.
 #define SCHEDI_JOB_EPOLLSOCKET_BUFFERSIZE 1024
 
@@ -171,9 +174,23 @@ struct schedi_job_epoll_requests_list {
 
 // Bit layout of the packed @htc field, see struct schedi_job_epollsocket.
 #define SCHEDI_JOB_EPOLLSOCKET_COUNT_SHIFT 0
+
+#ifdef SCHEDI_EXT_TIMEOUT
+
+#define SCHEDI_JOB_EPOLLSOCKET_AVAIL_SHIFT 28
+#define SCHEDI_JOB_EPOLLSOCKET_COUNT_MASK ((1ULL << 28) - 1)
+#define SCHEDI_JOB_EPOLLSOCKET_AVAIL_MASK  (((1ULL << 28) - 1) << 28)
+#define SCHEDI_JOB_EPOLLSOCKET_TIMEOUT	(1ULL << 57)
+
+#else
+
 #define SCHEDI_JOB_EPOLLSOCKET_AVAIL_SHIFT 29
 #define SCHEDI_JOB_EPOLLSOCKET_COUNT_MASK  ((1ULL << 29) - 1)
 #define SCHEDI_JOB_EPOLLSOCKET_AVAIL_MASK  (((1ULL << 29) - 1) << 29)
+
+#endif /*SCHEDI_EXT_TIMEOUT*/
+
+
 #define SCHEDI_JOB_EPOLLSOCKET_EPOLLDID	(1ULL << 58)
 // "epoll did". socket is ready no matter what
 #define SCHEDI_JOB_EPOLLSOCKET_EPOLLNT		(1ULL << 59)
@@ -214,16 +231,15 @@ struct schedi_job_epoll_requests_list {
  *                (write_return).
  * @write_avail_condition: The write_ready threshold: write_ready is set once
  *                         avail reaches this value.
- * @fall: Reference count for this socket, 3 on start: one reference held by
- *        the owning job, one by each of the two epoll registrations (read and
- *        write). When the epoll system removes the socket from an epoll list
- *        (epoll_ctl DEL), it decreases this; when the job decides it is done
- *        with the socket, it decreases this too. The first one that decreases
- *        it from 1 frees the socket.
- * @epoll_fall: Number of outstanding epoll registrations for this socket
- *              (2 on start). When it reaches 0 the socket is marked EPOLLDID.
- * @data_ptr_read: Registered epoll data pointer for the read epoll instance.
- * @data_ptr_write: Registered epoll data pointer for the write epoll instance.
+ * @fall: Reference count for this socket, 2 on start: one reference held by
+ *        the owning job, one by epoll registration When the epoll system 
+ *        removes the socket from an epoll list (epoll_ctl DEL), it decreases 
+ *        this; when the job decides it is done with the socket, it decreases 
+ *        this too. The first one that decreases it from 1 frees the socket.
+ * @data_ptr: Registered epoll data pointer for all epoll categories.
+ * @epolling: Currently adding stuff to epoll. While this is true, epoll
+ * should not delete any fds from the epoll list.
+ *
  *
  * count is the number of bytes buffered in @read_buffer, ranging from 0 to
  * SCHEDI_JOB_EPOLLSOCKET_BUFFERSIZE. It grows as data is received into the
@@ -260,10 +276,13 @@ struct schedi_job_epollsocket {
 	uint32_t write_avail_condition;
 
 	_Atomic int fall;
-	_Atomic int epoll_fall;
 
-	struct schedi_epoll_data* data_ptr_read;
-	struct schedi_epoll_data* data_ptr_write;
+	struct schedi_epoll_data* data_ptr;
+
+#ifdef SCHEDI_EXT_TIMEOUT
+	time_t timeout_sec;
+	int to_timer_fd;
+#endif /*SCHEDI_EXT_TIMEOUT*/
 };
 
 
@@ -450,6 +469,8 @@ void schedi_job_required_available_socket(struct schedi_job* job,
 		int required_available_sockets);
 
 
+
+
 /**
  * schedi_job_epoll_request_return() - Called by the main epoll loop after an
  * event.
@@ -489,6 +510,39 @@ int schedi_job_epoll_request_return(struct schedi_job_epoll_request *req, int er
  */
 int schedi_job_tool_epoll(struct schedi_job *job, int socketfd, uint32_t events);
 
+
+/**
+ * schedi_job_epollsocket_push_epoll() - Pushes a socket's fd to the epoll
+ * mechanism.
+ * @_socket: The socket.
+ *
+ * Return: 0 on success, non-zero on failure.
+ */
+int schedi_job_epollsocket_push_epoll(struct schedi_job_epollsocket* _socket);
+
+/**
+ * schedi_job_epollsocket_epollisize() - Puts every required fd to epoll
+ * mechanism appropriately.
+ * @_socket: The socket.
+ *
+ * Return: 0 on success, non-zero on failure.
+ */
+int schedi_job_epollsocket_epollisize(struct schedi_job_epollsocket* _socket);
+
+/**
+ * schedi_job_epollsocket_epollagain() - Puts the socket back to epoll sstem
+ * after epoll is done with it.
+ * @_socket: The socket.
+ *
+ * Does not works if EPOLLDID is not marked, thus returning failure.
+ *
+ * Return: 0 on success, non-zero on failure.
+ */
+int schedi_job_epollsocket_epollagain(struct schedi_job_epollsocket *_socket);
+
+
+#ifndef SCHEDI_EXT_TIMEOUT
+
 /**
  * schedi_job_tool_epollsocket() - Assigns a socket as schedi epoll socket.
  * @job: Job that uses tool epollsocket.
@@ -501,12 +555,69 @@ int schedi_job_tool_epoll(struct schedi_job *job, int socketfd, uint32_t events)
  * requires a schedi_job_mark_access on the job.
  *
  * Return: Returns the associated socket on success, NULL on failure. On
- * exit of job, schedi_job_tool_epollsocket_done() should be called on this to
+ * exit of job, schedi_job_epollsocket_done() should be called on this to
  * indicate that job does not need that socket anymore.
  */
 struct schedi_job_epollsocket* 
 schedi_job_tool_epollsocket(struct schedi_job *job, int socketfd, 
 		uint32_t read_cond, uint32_t write_cond);
+#else
+
+struct schedi_job_epollsocket* 
+schedi_job_tool_epollsocket(struct schedi_job *job, int socketfd, 
+		uint32_t read_cond, uint32_t write_cond, time_t timeout_sec);
+
+/**
+ * schedi_job_epollsocket_timer_push_epoll() - Pushes timer to the epoll
+ * mechanism.
+ * @_socket: The socket.
+ *
+ * Return: 0 on success, non-zero on failure.
+ */
+int schedi_job_epollsocket_timer_push_epoll(
+		struct schedi_job_epollsocket *_socket);
+
+/**
+ * schedi_job_epollsocket_timeout_cas() - Marks socket as timed out.
+ * @_socket: The socket.
+ */
+void schedi_job_epollsocket_timeout_cas(
+		struct schedi_job_epollsocket* _socket);
+
+/**
+ * schedi_job_epollsocket_timeout_reset() - Resets the timeout timer.
+ * @_socket: epollsocket that will the timer's be resetted.
+ *
+ * Return: 0 on success, non-zero on failure.
+ */
+int schedi_job_epollsocket_timeout_reset(
+		struct schedi_job_epollsocket* _socket);
+
+/**
+ * schedi_job_epollsocket_timeout_stop() - Stops the timeout timer.
+ * @_socket: epollsocket that will the timer's be resetted.
+ *
+ * Return: 0 on success, non-zero on failure.
+ */
+int schedi_job_epollsocket_timeout_stop(
+		struct schedi_job_epollsocket* _socket);
+
+
+/**
+ * schedi_job_epollsocket_timeout() - Informs if socket is timed out or not.
+ *
+ * Return: Non-zero if timed out, zero if not.
+ */
+int schedi_job_epollsocket_timeout(struct schedi_job_epollsocket* _socket);
+
+#endif /*SCHEDI_EXT_TIMEOUT*/
+
+/**
+ * schedi_job_epollsocket_ready() - Informs if socket is ready or not.
+ *
+ * Return: non-zero if ready, zero if not on the current check.
+ */
+int schedi_job_epollsocket_ready(struct schedi_job_epollsocket* _socket);
 
 /**
  * schedi_job_tool_epollsocket_read_cond() - Change reading condition.
@@ -536,11 +647,11 @@ bool schedi_job_epollsocket_accessjob(struct schedi_job_epollsocket* sock);
 
 
 
-
 /**
  * schedi_job_epollsocket_done_() - Indicates epollsocket usage is over.
  * @epollside: Tells the function whether this call is made from the epoll
- * system or not.
+ * system or not. 0 means its the job side, 1 means its epollside's ready
+ * socket, 2 means its epollside's write socket.
  *
  * This function is called from epoll system and jobs itself. The last one
  * calling this function will be freeing the socket.
@@ -550,7 +661,7 @@ bool schedi_job_epollsocket_accessjob(struct schedi_job_epollsocket* sock);
  * Return: -1 if socket is not freed yet, 0 if it is freed on this call.
  */
 int schedi_job_epollsocket_done_(struct schedi_job_epollsocket*, 
-		bool epollside);
+		int epollside);
 
 /**
  * schedi_job_epollsocket_done() - Indicates epollsocket usage is over.

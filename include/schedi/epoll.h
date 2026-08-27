@@ -11,10 +11,12 @@
  * SCHEDI_EPOLL_DATA_SOCKET - 	long time socket. It is handled in specific
  * 				conditions. Otherwise, received data will only 
  * 				be stored in the ring buffer.
+ * SCHEDI_EPOLL_DATA_EPOLLSOCKTO - Timeout for an epollsocket.
  */
 #define SCHEDI_EPOLL_DATA_NONE      0
 #define SCHEDI_EPOLL_DATA_JOB       1
 #define SCHEDI_EPOLL_DATA_SOCKET	2
+#define SCHEDI_EPOLL_DATA_EPOLLSOCKTO	101
 
 /**
  * struct schedi_epoll_data - Tagged union for epoll event dispatch.

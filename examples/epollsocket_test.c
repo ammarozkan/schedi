@@ -38,7 +38,11 @@ int job_func(struct schedi_job* job)
 
 	switch(job->phase) {
 	case 0: {
+#ifdef SCHEDI_EXT_TIMEOUT
+		ctx->socket = schedi_job_tool_epollsocket(job, ctx->fd, 1, 0, 3);
+#else
 		ctx->socket = schedi_job_tool_epollsocket(job, ctx->fd, 1, 0);
+#endif /*SCHEDI_EXT_TIMEOUT*/
 		schedi_job_required_available_socket(job, 1);
 		job->phase = 1;
 		return 1;

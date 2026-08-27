@@ -4,6 +4,7 @@ CPPFLAGS := -I include
 #SCHEDIFLAGS := -DLOCKLESS_READYJOB
 LDFLAGS := -pthread
 SANITIZE ?=
+TIMEOUTFL ?=
 
 SRC := $(wildcard src/*.c)
 OBJ := $(SRC:src/%.c=build/%.o)
@@ -18,13 +19,13 @@ libschedi.a: $(OBJ)
 	ar rcs $@ $^
 
 build/%.o: src/%.c | build
-	$(CC) $(CFLAGS) $(CPPFLAGS) $(SCHEDIFLAGS) $(SANITIZE) -c -o $@ $<
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(SCHEDIFLAGS) $(TIMEOUTFL) $(SANITIZE) -c -o $@ $<
 
 build:
 	mkdir -p build
 
 bin/%: examples/%.c libschedi.a | bin
-	$(CC) $(CFLAGS) $(CPPFLAGS) $(SCHEDIFLAGS) $(SANITIZE) -o $@ $< libschedi.a $(LDFLAGS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(SCHEDIFLAGS) $(TIMEOUTFL) $(SANITIZE) -o $@ $< libschedi.a $(LDFLAGS)
 
 bin:
 	mkdir -p bin
@@ -34,5 +35,8 @@ clean:
 
 sanitize:
 	$(MAKE) SANITIZE=-fsanitize=thread all
+
+timeout:
+	$(MAKE) TIMEOUTFL=-DSCHEDI_EXT_TIMEOUT all
 
 .PHONY: all clean lib sanitize
